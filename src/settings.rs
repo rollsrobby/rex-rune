@@ -137,16 +137,18 @@ pub enum ChromeTheme {
     RosePine,
     RosePineMoon,
     GruvboxDark,
+    TokyoNight,
     #[default]
     #[serde(other)]
     Midnight,
 }
 impl ChromeTheme {
-    pub const ALL: [ChromeTheme; 4] = [
+    pub const ALL: [ChromeTheme; 5] = [
         ChromeTheme::Midnight,
         ChromeTheme::RosePine,
         ChromeTheme::RosePineMoon,
         ChromeTheme::GruvboxDark,
+        ChromeTheme::TokyoNight,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -154,6 +156,7 @@ impl ChromeTheme {
             ChromeTheme::RosePine => "Rosé Pine",
             ChromeTheme::RosePineMoon => "Rosé Pine Moon",
             ChromeTheme::GruvboxDark => "Gruvbox Dark",
+            ChromeTheme::TokyoNight => "Tokyo Night",
         }
     }
 }
@@ -762,6 +765,7 @@ mod tests {
             (ChromeTheme::RosePine, "rose_pine"),
             (ChromeTheme::RosePineMoon, "rose_pine_moon"),
             (ChromeTheme::GruvboxDark, "gruvbox_dark"),
+            (ChromeTheme::TokyoNight, "tokyo_night"),
         ] {
             let s = Settings {
                 chrome_theme: chrome,
