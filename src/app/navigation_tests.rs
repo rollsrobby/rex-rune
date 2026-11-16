@@ -114,7 +114,7 @@ fn rapid_ctrl_tab_with_notice() {
 }
 
 #[test]
-fn ctrl_tab_wraps_but_page_keys_stay_server_side_without_a_view() {
+fn ctrl_tab_wraps_and_page_keys_request_server_wrap_without_a_view() {
     let (ws, rx) = tabbed_workspace("single");
     let mut rt = runtime(ws);
     cycle(&mut rt, false);
@@ -145,7 +145,7 @@ fn ctrl_tab_wraps_but_page_keys_stay_server_side_without_a_view() {
     );
     assert!(
         sent.iter()
-            .all(|r| r.2.get("wrap").is_none() && r.2.get("window_id").is_none())
+            .all(|r| r.2["wrap"] == true && r.2.get("window_id").is_none())
     );
     std::fs::remove_file(&rt.state.settings_path).ok();
 }
