@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 pub const SEARCH: &str = "client.search";
 pub const SELECT_SESSION: &str = "session.select";
+pub const LAST_SESSION: &str = "client.session.last";
 pub const NEXT_GLOBAL: &str = "client.tab.next_global";
 pub const PREVIOUS_GLOBAL: &str = "client.tab.previous_global";
 pub const HISTORY_BACK: &str = "client.history.back";
@@ -35,6 +36,7 @@ enum Handler {
     ZoomOut,
     ZoomReset,
     SwitchSession,
+    LastSession,
     Activity,
     PairDevice,
     StopServer,
@@ -116,6 +118,7 @@ specs! {
     "client.zoom.out" => ZoomOut,
     "client.zoom.reset" => ZoomReset,
     "session.switch" => SwitchSession,
+    LAST_SESSION => LastSession,
     super::activity_list::ACTION => Activity,
     super::pair_device::ACTION => PairDevice,
     super::server_page::STOP => StopServer,
@@ -260,7 +263,7 @@ impl Spec {
             ZoomIn | ZoomOut | ZoomReset => Remote::Never(
                 "Only the person at this computer can change saved interface preferences.",
             ),
-            NextGlobal | PreviousGlobal | Back | Forward => {
+            NextGlobal | PreviousGlobal | Back | Forward | LastSession => {
                 Remote::Never("Use rex do session.select on the target host instead.")
             }
             Reconnect => Remote::Never("Only the person at this computer can reconnect terminals."),
@@ -380,6 +383,7 @@ impl Spec {
             Handler::ZoomOut => "Decrease interface zoom",
             Handler::ZoomReset => "Reset interface zoom",
             Handler::SwitchSession => "Switch session",
+            Handler::LastSession => "Last session",
             Handler::Activity => "Show activity",
             Handler::PairDevice => "Pair device…",
             Handler::StopServer => "Stop server…",
@@ -460,6 +464,7 @@ impl Spec {
             | Handler::Back
             | Handler::Forward
             | Handler::SwitchSession
+            | Handler::LastSession
             | Handler::Activity
             | Handler::SelectSession
             | Handler::GotoTab
@@ -641,6 +646,7 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
         Handler::ZoomOut => s.change_ui_scale(-1, tx),
         Handler::ZoomReset => s.change_ui_scale(0, tx),
         Handler::SwitchSession => s.picker(true),
+        Handler::LastSession => s.last_session(tx),
         Handler::Activity => {
             if let Some(view) = args["view"].as_str() {
                 s.set_activity_view(if view == "session" {
