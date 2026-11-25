@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use rexrs::AsyncRexClient;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use std::{collections::HashMap, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -143,22 +145,22 @@ impl Transport {
         rexrs::AsyncTransport::send(self, text).await?;
         Ok(receiver)
     }
+}
 
-    fn detached_reply(&mut self, text: &str) -> Option<oneshot::Sender<String>> {
-        #[derive(serde::Deserialize)]
-        struct Response {
-            #[serde(rename = "type")]
-            kind: String,
-            id: Option<String>,
-        }
-        if self.detached.is_empty() {
-            return None;
-        }
-        let response: Response = serde_json::from_str(text).ok()?;
-        (response.kind == "response")
-            .then(|| self.detached.remove(response.id.as_deref()?))
-            .flatten()
-    }
+#[derive(Deserialize)]
+struct ControlFrame {
+    #[serde(rename = "type")]
+    kind: String,
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DetachedEnvelope<'a, E> {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(borrow)]
+    pub payload: Option<&'a RawValue>,
+    pub error: Option<E>,
 }
 
 /// Decode a response intercepted by `detach` with the same defaults as an SDK call.
@@ -205,8 +207,16 @@ impl rexrs::AsyncTransport for Transport {
         loop {
             match self.socket.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    if let Some(reply) = self.detached_reply(&text) {
-                        let _ = reply.send(text.to_string());
+                    if let Ok(frame) = serde_json::from_str::<ControlFrame>(&text)
+                        && frame.kind == "response"
+                        && let Some(id) =
+                            frame.id.as_deref().filter(|id| id.starts_with("detached:"))
+                    {
+                        // A cancelled or timed-out read still owns its response ID.
+                        // Never hand the late payload to the SDK's generic parser.
+                        if let Some(reply) = self.detached.remove(id) {
+                            let _ = reply.send(text.to_string());
+                        }
                         continue;
                     }
                     return Ok(rexrs::transport::Frame::Text(text.to_string()));
@@ -238,7 +248,7 @@ impl rexrs::AsyncTransport for Transport {
 
 pub type Client = AsyncRexClient<Transport>;
 pub const MIN_API_REVISION: u32 = 10;
-pub const API_REVISION: u32 = 21;
+pub const API_REVISION: u32 = 24;
 pub async fn control(endpoint: &str, reconnect: Option<&str>) -> Result<Client> {
     control_with_label(endpoint, reconnect, &crate::settings::hostname()).await
 }

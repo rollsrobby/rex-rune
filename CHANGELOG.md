@@ -4,6 +4,8 @@
 
 ### Added
 
+- The client library reads Program Resume record metadata on API 24. No UI yet. Snapshot 2646 does not rerun the reported programs after restart.
+
 - **Local echo** in Settings → Terminal can show pending keystrokes on slow links after the terminal echoes ordinary text. It defaults to Off. Thanks to @johnknott (#180).
 
 - **Focus history (Rex Server API 19+).** Step back through server-side focus history across panes, tabs, and sessions via **Previous focus**, **Previous focused pane in tab**, **Previous focused tab**, and **Previous focused session** in Commands (backed by `focus_history.reverse`). Consecutive keybinding presses of the same scope walk deeper through history using the server's cursor; any other input, navigation, or panel (including opening Commands) resets the walk so the next invocation toggles between the two most recent focuses. `client.focus_history.reverse` is local-only (`Remote::Never`), unbound by default, and supports optional `scope` arguments (`any`, `pane`, `tab`, `tab_any_session`, `session`) in keymaps and Settings -> Shortcuts. Passive refreshes of already-attached sessions use `session.attach` on API 19+ so they do not record focus (avoiding focus-history overwrites from background pane exits or idle clients on attached sessions), while unattached background sweeps keep using `session.view` so Rex Rune never joins unopened sessions. Existing local Back/Forward navigation (`client.history.back` / `client.history.forward`) is unchanged.
@@ -15,6 +17,8 @@
 - **Interactive `rex.ui` script prompts (Closes [#144](https://github.com/shuv1337/rex-rune/issues/144)).** Completes `rex.ui` support (API 17+) across both `input` and `pick` (single, multiple, and `allow_other`) prompts. Adds an arrival-ordered prompt queue per host with calm auto-open rules (never clobbering open local dialogs, waiting during active typing unless triggered by this client's own in-flight `client.action`, and respecting a 10-second per-host post-cancel cool-down), demotion draft preservation, and a 300 ms accidental-submit guard plus Enter repeat suppression. Renders an anti-spoofing modal over a persistent dark scrim (clicking outside does nothing; Escape/Cancel ends the prompt) with client-owned `Question from <saved host label>` attribution, medium 15 pt script title, mono action subline, destination footnote, 16 authored 20x20 stroke icons plus generic fallback, 4,096-character input cap, inline `bad_request` rejection errors without losing drafts, and 640x480 minimum-window fit. Adds a `WARNING` waiting toolbar chip (`Question · <host>` / `<N> questions`, floating when the toolbar is hidden), a Commands entry (`Answer question from <host>…`), a per-host **Allow script prompts** switch in Settings -> Remote Hosts (default on, opt-out persisted in `settings::Host.prompts`), and zero-PTY-leak input guards. [Scope, captures, and live X11 checks](docs/parity-2026-11/rex-ui.md).
 
 ### Changed
+
+- Negotiates Rex Server API revisions 10 through 24 and refreshes the SDK capture from snapshot 2646. [Compatibility record](docs/server-api24.md).
 
 - Terminal input no longer waits a round trip per keystroke on slow links. Adjacent resizes and matching mouse motions coalesce, and multi-pane metadata and themes load in batches. Thanks to @johnknott (#179).
 
