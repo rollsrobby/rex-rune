@@ -80,6 +80,12 @@ pub const BUILTINS: &[Builtin] = &[
         chrome: ChromeTheme::GruvboxDark,
         theme: TerminalTheme::gruvbox_dark,
     },
+    Builtin {
+        id: "tokyo-night",
+        name: "Tokyo Night",
+        chrome: ChromeTheme::TokyoNight,
+        theme: TerminalTheme::tokyo_night,
+    },
 ];
 
 /// The built-in theme a `named:` id refers to, if it names one.
@@ -140,6 +146,18 @@ impl TerminalTheme {
             scheme: Some("dark"),
             ..Self::default()
         }
+    }
+
+    /// Tokyo Night's dark terminal palette, paired with the interface's ground.
+    pub fn tokyo_night() -> Self {
+        Self::full(
+            0x1a1b26,
+            [0xc0caf5, 0xc0caf5, 0x1a1b26, 0x283457, 0xc0caf5],
+            [
+                0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6,
+                0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
+            ],
+        )
     }
 
     /// A dark theme with every colour: foreground, cursor, cursor text, selection background

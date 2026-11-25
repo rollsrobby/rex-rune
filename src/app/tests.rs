@@ -2076,6 +2076,7 @@ fn the_theme_picker_filters_declares_to_every_host_and_returns_to_settings() {
             row("Rosé Pine", "Built in", false),
             row("Rosé Pine Moon", "Built in", false),
             row("Gruvbox Dark", "Built in", false),
+            row("Tokyo Night", "Built in", false),
             row("Rex Test Mocha", "Dark", false),
             row("Paper", "Light", false),
         ]
@@ -3836,6 +3837,7 @@ fn a_chrome_palette_applies_at_once_and_brings_its_terminal_theme_until_one_is_c
             ("Rosé Pine".to_owned(), false),
             ("Rosé Pine Moon".to_owned(), false),
             ("Gruvbox Dark".to_owned(), false),
+            ("Tokyo Night".to_owned(), false),
         ]
     );
     let rose = rt
@@ -3885,11 +3887,17 @@ fn a_chrome_palette_applies_at_once_and_brings_its_terminal_theme_until_one_is_c
         (ChromeTheme::RosePine, false)
     );
 
-    rt.update(|s, tx| s.perform(Intent::Chrome(ChromeTheme::GruvboxDark), tx));
+    rt.update(|s, tx| s.perform(Intent::Chrome(ChromeTheme::TokyoNight), tx));
+    // Build the next frame before inspecting its newly selected palette.
+    rt.frame(1. / 60.);
+    assert_eq!(window(&rt), super::theme::rgb(0x1a1b26));
+    assert_eq!(super::theme::kit().c.page, super::theme::rgb(0x1a1b26));
+    let saved = Settings::load(&rt.state.settings_path).unwrap();
+    assert_eq!(saved.chrome_theme, ChromeTheme::TokyoNight);
     for host in &hosts {
         assert_eq!(
             declared(host),
-            [Some(TerminalTheme::gruvbox_dark().args())],
+            [Some(TerminalTheme::tokyo_night().args())],
             "Follow chrome follows the next palette"
         );
     }

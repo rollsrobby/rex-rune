@@ -4,6 +4,7 @@
 
 ### Added
 
+- **Last session** in Commands toggles between the last two visited sessions, including across hosts, without restoring an old tab. Bind `client.session.last` in Settings → Shortcuts; no default shortcut is assigned.
 - **Focus history (Rex Server API 19+).** Step back through server-side focus history across panes, tabs, and sessions via **Previous focus**, **Previous focused pane in tab**, **Previous focused tab**, and **Previous focused session** in Commands (backed by `focus_history.reverse`). Consecutive keybinding presses of the same scope walk deeper through history using the server's cursor; any other input, navigation, or panel (including opening Commands) resets the walk so the next invocation toggles between the two most recent focuses. `client.focus_history.reverse` is local-only (`Remote::Never`), unbound by default, and supports optional `scope` arguments (`any`, `pane`, `tab`, `tab_any_session`, `session`) in keymaps and Settings -> Shortcuts. Passive refreshes of already-attached sessions use `session.attach` on API 19+ so they do not record focus (avoiding focus-history overwrites from background pane exits or idle clients on attached sessions), while unattached background sweeps keep using `session.view` so Rex Rune never joins unopened sessions. Existing local Back/Forward navigation (`client.history.back` / `client.history.forward`) is unchanged.
 
 - **Listening ports (Rex Server API 15+).** Find listening TCP ports in the current session from Commands or the pane menu. Copy an address anywhere, open a local port, or copy an SSH forwarding command without running it.
@@ -56,6 +57,7 @@ Full floating pane support (server actions, pointer drag, and 8-way edge resize)
 
 ### Fixed
 
+- Next tab wraps from the last tab to the first; Previous tab wraps from the first to the last within the session.
 - **Prefer `Mailbox` present mode on Linux Wayland top-level windows (#146).** Native Wayland windows already pace redraws with frame callbacks, so preferring `Mailbox` when the surface advertises it avoids FIFO double-blocking (reported at ~19 fps on KDE Plasma/KWin + Mesa RADV by [@koihia](https://github.com/koihia); not reproduced locally on NVIDIA/Hyprland) and falls back to `AutoVsync` otherwise. X11, macOS, Windows, and Wayland layer-shell overlays keep `AutoVsync` by default, and `RUNE_PRESENT_MODE=fifo|fifo-relaxed|mailbox|immediate|auto` is available as an override validated against surface capabilities.
 
 - **Terminal IME stays enabled when a program hides the hardware cursor ([#150](https://github.com/shuv1337/rex-rune/issues/150), reported by [@mag1c1an1](https://github.com/mag1c1an1)).** Full-screen TUIs that hide the hardware cursor (`CSI ?25l`) and draw their own cursor no longer disable native input methods or hide inline preedit text. The focused terminal now keeps a dedicated invisible IME anchor at the terminal's cursor cell (clamped into cropped viewports, or bottom-left when scrolled back) without drawing a hardware cursor when hidden, and clears any active preedit when the input method disables.

@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 pub const SEARCH: &str = "client.search";
 pub const SELECT_SESSION: &str = "session.select";
+pub const LAST_SESSION: &str = "client.session.last";
 pub const MUTE_TAB: &str = "client.tab.mute";
 pub const NEXT_GLOBAL: &str = "client.tab.next_global";
 pub const PREVIOUS_GLOBAL: &str = "client.tab.previous_global";
@@ -40,6 +41,7 @@ enum Handler {
     ZoomOut,
     ZoomReset,
     SwitchSession,
+    LastSession,
     Activity,
     Ports,
     PairDevice,
@@ -131,6 +133,7 @@ specs! {
     "client.zoom.out" => ZoomOut,
     "client.zoom.reset" => ZoomReset,
     "session.switch" => SwitchSession,
+    LAST_SESSION => LastSession,
     super::activity_list::ACTION => Activity,
     super::ports::ACTION => Ports,
     super::pair_device::ACTION => PairDevice,
@@ -297,7 +300,7 @@ impl Spec {
             ZoomIn | ZoomOut | ZoomReset => Remote::Never(
                 "Only the person at this computer can change saved interface preferences.",
             ),
-            NextGlobal | PreviousGlobal | Back | Forward => {
+            NextGlobal | PreviousGlobal | Back | Forward | LastSession => {
                 Remote::Never("Use rex do session.select on the target host instead.")
             }
             FocusHistoryReverse => {
@@ -439,6 +442,7 @@ impl Spec {
             Handler::ZoomOut => "Decrease interface zoom",
             Handler::ZoomReset => "Reset interface zoom",
             Handler::SwitchSession => "Switch session",
+            Handler::LastSession => "Last session",
             Handler::Activity => "Show activity",
             Handler::Ports => "Show listening ports",
             Handler::PairDevice => "Pair device…",
@@ -530,6 +534,7 @@ impl Spec {
             | Handler::Forward
             | Handler::FocusHistoryReverse
             | Handler::SwitchSession
+            | Handler::LastSession
             | Handler::Activity
             | Handler::Ports
             | Handler::SelectSession
@@ -763,8 +768,8 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
         Handler::FindNext => s.find_step(true),
         Handler::FindPrevious => s.find_step(false),
         Handler::NewTab => s.perform(Intent::NewWindow, tx),
-        Handler::NextTab => s.request("session.focus_next_window", json!({})),
-        Handler::PreviousTab => s.request("session.focus_previous_window", json!({})),
+        Handler::NextTab => s.request("session.focus_next_window", json!({"wrap": true})),
+        Handler::PreviousTab => s.request("session.focus_previous_window", json!({"wrap": true})),
         Handler::NextGlobal => s.cycle_tab(1, tx),
         Handler::PreviousGlobal => s.cycle_tab(-1, tx),
         Handler::Back => s.navigate_history(-1, tx),
@@ -780,6 +785,7 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
         Handler::ZoomOut => s.change_ui_scale(-1, tx),
         Handler::ZoomReset => s.change_ui_scale(0, tx),
         Handler::SwitchSession => s.picker(true),
+        Handler::LastSession => s.last_session(tx),
         Handler::Activity => {
             if let Some(view) = args["view"].as_str() {
                 s.set_activity_view(if view == "session" {
