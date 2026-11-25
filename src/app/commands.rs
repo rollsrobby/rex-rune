@@ -16,11 +16,17 @@
 use super::{
     about::{self, REPOSITORY},
     actions, find, help, keycaps, pane_header,
-    panel::{Entry, Intent, PaneAction, SessionAction, SessionTarget},
+    panel::{Entry, Intent, LayerAction, PaneAction, SessionAction, SessionTarget},
     splits::SplitWay,
     workspace::Workspace,
 };
-use rex_rune::{connection::HostCommand, settings::PaneDensity};
+use rex_rune::{
+    connection::{
+        HostCommand, UNDO_CLOSE_DISCONNECTED, UNDO_CLOSE_MIN_API_REVISION, UNDO_CLOSE_REQUIRES_API,
+    },
+    layers,
+    settings::PaneDensity,
+};
 use rune::Tx;
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -224,6 +230,8 @@ pub struct Command {
     pub group: Group,
     /// More words a search finds the row by, in lower case.
     pub keywords: Cow<'static, str>,
+    /// A disabled row's explanation is displayed, not searched as a shortcut.
+    blocked_reason: Option<&'static str>,
     pub entry: Entry,
 }
 
@@ -265,12 +273,19 @@ impl Command {
             id: id.into(),
             group,
             keywords: Cow::Borrowed(""),
+            blocked_reason: None,
             entry,
         }
     }
 
     fn enabled(mut self, enabled: bool) -> Self {
         self.entry.enabled = enabled;
+        self
+    }
+
+    fn blocked_by(mut self, reason: Option<&'static str>) -> Self {
+        self.entry.enabled = reason.is_none();
+        self.blocked_reason = reason;
         self
     }
 
@@ -311,7 +326,7 @@ impl Command {
         );
         let words: Vec<&str> = query.split_whitespace().collect();
         if !words.iter().all(|word| named.contains(word))
-            && !self.entry.detail.to_lowercase().contains(query)
+            && (self.blocked_reason.is_some() || !self.entry.detail.to_lowercase().contains(query))
         {
             return None;
         }
@@ -342,6 +357,26 @@ fn split_id(way: SplitWay) -> &'static str {
 }
 
 impl Workspace {
+    fn undo_close_blocked(&self) -> Option<&'static str> {
+        let model = self.model();
+        if !model.connected {
+            Some(UNDO_CLOSE_DISCONNECTED)
+        } else if model.protocol.api_revision < UNDO_CLOSE_MIN_API_REVISION {
+            Some(UNDO_CLOSE_REQUIRES_API)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn undo_close(&mut self) {
+        if let Some(reason) = self.undo_close_blocked() {
+            self.inform(reason);
+        } else {
+            let epoch = self.model().connection_epoch;
+            self.send(self.active, HostCommand::UndoClose { epoch });
+        }
+    }
+
     /// The session on screen, as the target of a session action.
     fn session_on_screen(&self) -> Option<SessionTarget> {
         let model = self.model();
@@ -434,6 +469,13 @@ impl Workspace {
                 Intent::ClientAction(super::activity_list::ACTION, json!({"view":"session"})),
             ),
             Command::action(
+                super::ports::ACTION,
+                G,
+                "Show listening ports…",
+                super::ports::ACTION,
+            )
+            .keywords("port server localhost forward tcp dev"),
+            Command::action(
                 "session.new",
                 G,
                 format!("New session on {host}"),
@@ -465,6 +507,32 @@ impl Workspace {
             )
             .detail("Mouse Forward")
             .keywords("navigate"),
+            Command::action(
+                "focus_history.reverse",
+                G,
+                "Previous focus",
+                actions::FOCUS_HISTORY_REVERSE,
+            )
+            .blocked_by(self.focus_history_blocked())
+            .keywords("focus history recent last pane tab session back toggle"),
+            {
+                let blocked = self.focus_history_blocked();
+                let row = Command::new(
+                    "focus_history.session",
+                    G,
+                    "Previous focused session",
+                    Intent::ClientAction(
+                        actions::FOCUS_HISTORY_REVERSE,
+                        json!({"scope": "session"}),
+                    ),
+                )
+                .keywords("focus history recent last back");
+                if blocked.is_some() {
+                    row.blocked_by(blocked)
+                } else {
+                    row.enabled(model.sessions.len() > 1)
+                }
+            },
             Command::action("session.refresh", G, "Refresh sessions", REFRESH_SESSIONS)
                 .enabled(self.hosts.iter().any(|h| h.model.connected))
                 .keywords("reload read list"),
@@ -510,6 +578,21 @@ impl Workspace {
                 "Previous tab across hosts",
                 actions::PREVIOUS_GLOBAL,
             ),
+            {
+                let blocked = self.focus_history_blocked();
+                let row = Command::new(
+                    "focus_history.tab",
+                    G,
+                    "Previous focused tab",
+                    Intent::ClientAction(actions::FOCUS_HISTORY_REVERSE, json!({"scope": "tab"})),
+                )
+                .keywords("focus history recent last back window");
+                if blocked.is_some() {
+                    row.blocked_by(blocked)
+                } else {
+                    row.enabled(in_session && several)
+                }
+            },
         ]);
         if let Some(entries) = self.tab_commands() {
             rows.extend(
@@ -550,7 +633,7 @@ impl Workspace {
         let model = self.model();
         let zoomed = model
             .window()
-            .is_some_and(|w| w.zoomed_block_id.as_ref() == Some(&target.block));
+            .is_some_and(|w| rex_rune::layout::is_zoomed(w, &target.block));
         // A row of the pane menu: it acts on `target`, and is available as it is there.
         let pane = |id, label: &'static str, action| {
             Command::new(id, G, label, Intent::Pane(target.clone(), action))
@@ -563,6 +646,10 @@ impl Workspace {
             pane("pane.paste", "Paste", PaneAction::Paste).keywords("clipboard"),
             pane("pane.select_all", "Select all", PaneAction::SelectAll)
                 .keywords("screen scrollback text"),
+            Command::action("pane.copy_mode", G, "Copy mode", super::copy_mode::ACTION)
+                .enabled(self.can_enter_copy_mode())
+                .keywords("vim scrollback select yank visual")
+                .section(1),
             Command::action("pane.search", G, "Search terminal…", actions::SEARCH)
                 .keywords("find")
                 .section(1),
@@ -589,17 +676,108 @@ impl Workspace {
             .keywords("maximize unzoom")
             .section(2),
         );
+        // Floating layers: each row changes one thing on the pane's or tab's layer, and its hint
+        // column says why when it can't. A minimized layer is listed by name here, so it can be
+        // restored without its hidden pane's menu. Every verb is unbound by default; the pane
+        // menu offers the same ones for the pane it names.
+        let focused_layer = self.focused_layer();
+        let layer_row = |id: &'static str, label: &'static str, action: LayerAction| {
+            let blocked = self.layer_blocked(focused_layer.as_ref(), action);
+            Command::action(id, G, label, action.name())
+                .detail(blocked.map(layers::Blocked::hint).unwrap_or_default())
+                .enabled(blocked.is_none())
+                .section(2)
+        };
+        rows.extend([
+            layer_row("pane.float", "Float pane", LayerAction::Float)
+                .keywords("detach window front"),
+            layer_row(
+                "pane.new_floating",
+                "New floating pane",
+                LayerAction::NewFloating,
+            )
+            .keywords("create new"),
+            layer_row(
+                "pane.minimize_layer",
+                "Minimize floating layer",
+                LayerAction::Minimize,
+            )
+            .keywords("hide"),
+            layer_row(
+                "pane.restore_layer",
+                "Restore and focus floating layer",
+                LayerAction::Focus,
+            )
+            .keywords("show raise"),
+            layer_row(
+                "pane.raise_layer",
+                "Bring floating layer to front",
+                LayerAction::Raise,
+            )
+            .keywords("stack order"),
+            layer_row(
+                "pane.return_to_tiles",
+                "Return pane to tiles",
+                LayerAction::ReturnToTiles,
+            )
+            .keywords("dock tile tiled anchor"),
+        ]);
+        for target in self.floating_layer_targets() {
+            let blocked = self.layer_blocked(Some(&target), LayerAction::Focus);
+            let label = if target.minimized {
+                format!("Restore {}", target.name)
+            } else {
+                format!("Show {}", target.name)
+            };
+            let detail = match blocked {
+                Some(blocked) => blocked.hint(),
+                None if target.minimized => "Minimized, still running".into(),
+                None if target.panes.len() > 1 => format!("{} panes", target.panes.len()),
+                None => String::new(),
+            };
+            rows.push(
+                Command::row(
+                    format!("pane.layer.{}", target.layer),
+                    G,
+                    Entry::new(label, "", "", Intent::Layer(target, LayerAction::Focus)),
+                )
+                .detail(detail)
+                .enabled(blocked.is_none())
+                .section(2),
+            );
+        }
+        let mut focus_rows = self.focus_commands().into_iter();
+        for id in ["pane.focus.next", "pane.focus.previous"] {
+            if let Some(entry) = focus_rows.next() {
+                rows.push(Command::row(id, G, entry).section(3));
+            }
+        }
+        let several_panes = model
+            .window()
+            .is_some_and(|w| w.layers.iter().flat_map(|l| &l.blocks).count() > 1);
+        let focus_blocked = self.focus_history_blocked();
+        let pane_history = Command::new(
+            "focus_history.pane",
+            G,
+            "Previous focused pane in tab",
+            Intent::ClientAction(actions::FOCUS_HISTORY_REVERSE, json!({"scope": "pane"})),
+        )
+        .keywords("focus history recent last back")
+        .section(3);
+        rows.push(if focus_blocked.is_some() {
+            pane_history.blocked_by(focus_blocked)
+        } else {
+            pane_history.enabled(several_panes)
+        });
         rows.extend(
             [
-                "pane.focus.next",
-                "pane.focus.previous",
                 "pane.focus.left",
                 "pane.focus.right",
                 "pane.focus.up",
                 "pane.focus.down",
             ]
             .into_iter()
-            .zip(self.focus_commands())
+            .zip(focus_rows)
             .map(|(id, entry)| Command::row(id, G, entry).section(3)),
         );
         for action in ["pane.move", "pane.resize"] {
@@ -689,6 +867,19 @@ impl Workspace {
             )
             .destructive(),
             pane("pane.close", "Close pane…", PaneAction::Close).destructive(),
+            {
+                let blocked = self.layer_blocked(focused_layer.as_ref(), LayerAction::Close);
+                Command::action(
+                    "pane.close_layer",
+                    G,
+                    "Close floating layer…",
+                    "pane.close_layer",
+                )
+                .keywords("remove end")
+                .detail(blocked.map(layers::Blocked::hint).unwrap_or_default())
+                .enabled(blocked.is_none())
+                .destructive()
+            },
         ]);
         rows
     }
@@ -697,18 +888,24 @@ impl Workspace {
         use Group::Host as G;
         let host = self.active;
         let saved = &self.settings.hosts[host];
+        let blocked = self.shared_write_blocked(host);
         let name = &saved.label;
+        let mut edit = Command::new(
+            "host.edit",
+            G,
+            format!("Edit host {name}…"),
+            Intent::EditHost(host),
+        )
+        .enabled(blocked.is_none())
+        .keywords("endpoint name");
+        if let Some(reason) = &blocked {
+            edit = edit.detail(reason.clone());
+        }
         let mut rows = vec![
             Command::action("host.switch", G, "Switch host…", "client.host.switch"),
             Command::new("host.add", G, "Add host…", Intent::AddHost)
                 .keywords("remote connect server"),
-            Command::new(
-                "host.edit",
-                G,
-                format!("Edit host {name}…"),
-                Intent::EditHost(host),
-            )
-            .keywords("endpoint name"),
+            edit,
             Command::new(
                 "host.shell",
                 G,
@@ -735,6 +932,9 @@ impl Workspace {
             .keywords("tailscale qr phone"),
             Command::new("host.reconnect", G, "Reconnect host", Intent::Retry)
                 .keywords("retry connection"),
+            Command::action(actions::UNDO_CLOSE, G, "Undo close", actions::UNDO_CLOSE)
+                .blocked_by(self.undo_close_blocked())
+                .keywords("reopen restore pane tab window session"),
         ];
         if self.can_start_ssh(host) {
             rows.push(
@@ -745,6 +945,44 @@ impl Workspace {
                     Intent::StartSsh(host),
                 )
                 .detail(name.clone()),
+            );
+        }
+        if self.can_check_key(host).is_some() {
+            rows.push(
+                Command::new(
+                    "host.check_key",
+                    G,
+                    "Check host key…",
+                    Intent::HostKey(host),
+                )
+                .detail(name.clone()),
+            );
+        }
+        if self.can_install_ssh(host) {
+            rows.push(
+                Command::new(
+                    "host.install_rex",
+                    G,
+                    "Install Rex on this host…",
+                    Intent::InstallSsh(host),
+                )
+                .detail(name.clone()),
+            );
+        }
+        for waiting in self.waiting_prompts() {
+            let label = self
+                .host_index(waiting.host)
+                .map(|i| self.settings.hosts[i].label.clone())
+                .unwrap_or_else(|| "host".into());
+            rows.push(
+                Command::new(
+                    format!("host.answer_prompt.{}", waiting.host.0),
+                    G,
+                    format!("Answer question from {label}…"),
+                    Intent::OpenPrompt(waiting.key()),
+                )
+                .keywords("prompt question script rex.ui")
+                .detail(waiting.prompt.title.clone()),
             );
         }
         rows.extend([
@@ -765,15 +1003,21 @@ impl Workspace {
             )
             .enabled(self.can_stop_server())
             .destructive(),
-            Command::new(
-                "host.remove",
-                G,
-                format!("Remove host {name}…"),
-                Intent::RemoveHost(host),
-            )
-            .enabled(self.settings.hosts.len() > 1)
-            .keywords("forget delete")
-            .destructive(),
+            {
+                let mut remove = Command::new(
+                    "host.remove",
+                    G,
+                    format!("Remove host {name}…"),
+                    Intent::RemoveHost(host),
+                )
+                .enabled(self.settings.hosts.len() > 1 && blocked.is_none())
+                .keywords("forget delete")
+                .destructive();
+                if let Some(reason) = &blocked {
+                    remove = remove.detail(reason.clone());
+                }
+                remove
+            },
         ]);
         rows
     }
@@ -1046,6 +1290,10 @@ impl Workspace {
         commands.extend(self.app_commands());
         for command in &mut commands {
             self.shortcut_details(std::slice::from_mut(&mut command.entry));
+            if let Some(reason) = command.blocked_reason {
+                command.entry.detail = reason.into();
+                command.entry.keys.clear();
+            }
         }
         let server = self.server_commands(&commands);
         commands.splice(after_host..after_host, server);
@@ -1086,6 +1334,7 @@ impl Workspace {
                 .map(|mut command| {
                     (command.entry.group, command.entry.group_name) =
                         self.group_heading(command.group);
+                    command.entry.id = Some(command.id);
                     command.entry
                 })
                 .collect();
@@ -1095,6 +1344,7 @@ impl Workspace {
             .filter_map(|mut command| {
                 let rank = command.rank(&query)?;
                 command.entry.group = "Commands".into();
+                command.entry.id = Some(command.id);
                 Some((rank, command.entry))
             })
             .collect();

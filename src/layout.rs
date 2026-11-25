@@ -1,6 +1,6 @@
 //! Translate authoritative Rex split trees to normalized native pane geometry.
 use rexrs::api::{
-    session::{ViewLayoutNode, Window},
+    session::{Layer, ViewLayoutNode, Window},
     terminal::SetTheme,
 };
 use serde_json::{Value, json};
@@ -73,6 +73,7 @@ fn shell_layout_sets_the_shell_and_theme_only_when_given() {
 pub struct Placement {
     pub block: String,
     pub rect: [f64; 4],
+    pub layer_index: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Divider {
@@ -81,27 +82,133 @@ pub struct Divider {
     pub horizontal: bool,
     pub rect: [f64; 4],
     pub ratio: f64,
+    pub layer_index: usize,
 }
 impl Divider {
     pub fn key(&self) -> String {
         format!("{}:{}", self.before, self.after)
     }
 }
+/// The block zoomed over the entire window (in front of every layer).
+///
+/// Covers both legacy API 10-20 zoom (`tiled_zoomed_block_id` is absent) and API 21 floating
+/// layer zoom (`zoomed_block_id` differs from `tiled_zoomed_block_id`).
+pub fn full_window_zoom(window: &Window) -> Option<&str> {
+    if window.zoomed_block_id != window.tiled_zoomed_block_id {
+        window.zoomed_block_id.as_deref()
+    } else {
+        None
+    }
+}
+
+fn node_contains(node: &ViewLayoutNode, block: &str) -> bool {
+    if node.block_id.as_deref() == Some(block) {
+        return true;
+    }
+    node.split.as_ref().is_some_and(|split| {
+        split
+            .before
+            .as_deref()
+            .is_some_and(|b| node_contains(b, block))
+            || split
+                .after
+                .as_deref()
+                .is_some_and(|a| node_contains(a, block))
+    })
+}
+
+fn layer_contains(layer: &Layer, block: &str) -> bool {
+    layer
+        .blocks
+        .iter()
+        .any(|b| b.block_id.as_deref() == Some(block))
+        || layer
+            .layout
+            .as_ref()
+            .is_some_and(|node| node_contains(node, block))
+}
+
+/// The block zoomed on the tiled layer behind all non-minimized floating layers (API 21).
+/// Returns `None` while a full-window zoom covers everything, or if the named block does not
+/// exist in a non-minimized tiled layer.
+pub fn tiled_zoom(window: &Window) -> Option<&str> {
+    if full_window_zoom(window).is_some() {
+        return None;
+    }
+    let block = window.tiled_zoomed_block_id.as_deref()?;
+    window
+        .layers
+        .iter()
+        .any(|layer| {
+            layer.kind == "tiled"
+                && layer.state.as_deref() != Some("minimized")
+                && layer_contains(layer, block)
+        })
+        .then_some(block)
+}
+
+/// Whether `block` is zoomed (either full-window or on the tiled layer).
+pub fn is_zoomed(window: &Window, block: &str) -> bool {
+    full_window_zoom(window) == Some(block) || tiled_zoom(window) == Some(block)
+}
+
+/// Whether any block in `window` is zoomed (full-window or tiled).
+pub fn any_zoomed(window: &Window) -> bool {
+    full_window_zoom(window).is_some() || tiled_zoom(window).is_some()
+}
+
+/// Whether `block` in `layer` is visible under `window`'s current zoom and layer state.
+pub fn block_visible(window: &Window, layer: &Layer, block: &str) -> bool {
+    if let Some(zoom) = full_window_zoom(window) {
+        return zoom == block;
+    }
+    if layer.state.as_deref() == Some("minimized") {
+        return false;
+    }
+    if let Some(zoom) = tiled_zoom(window)
+        && layer.kind == "tiled"
+    {
+        return zoom == block;
+    }
+    true
+}
+
 pub fn placements(window: &Window, drag: Option<(&str, f64)>) -> (Vec<Placement>, Vec<Divider>) {
-    if let Some(block) = &window.zoomed_block_id {
+    if let Some(block) = full_window_zoom(window) {
+        let layer_index = window
+            .layers
+            .iter()
+            .position(|l| {
+                l.blocks
+                    .iter()
+                    .any(|b| b.block_id.as_deref() == Some(block))
+            })
+            .unwrap_or(0);
         return (
             vec![Placement {
-                block: block.clone(),
+                block: block.to_owned(),
                 rect: [0., 0., 1., 1.],
+                layer_index,
             }],
             vec![],
         );
     }
+    let tiled_zoomed = tiled_zoom(window);
     let mut panes = Vec::new();
     let mut dividers = Vec::new();
-    for layer in &window.layers {
+    for (layer_index, layer) in window.layers.iter().enumerate() {
         // Its blocks keep running, but a minimized layer isn't drawn. Unknown states draw.
         if layer.state.as_deref() == Some("minimized") {
+            continue;
+        }
+        if layer.kind == "tiled"
+            && let Some(block) = tiled_zoomed
+        {
+            panes.push(Placement {
+                block: block.to_owned(),
+                rect: [0., 0., 1., 1.],
+                layer_index,
+            });
             continue;
         }
         if let Some(node) = &layer.layout {
@@ -110,7 +217,7 @@ pub fn placements(window: &Window, drag: Option<(&str, f64)>) -> (Vec<Placement>
                 .as_slice()
                 .try_into()
                 .unwrap_or([0., 0., 1., 1.]);
-            walk(node, rect, drag, &mut panes, &mut dividers);
+            walk(node, rect, layer_index, drag, &mut panes, &mut dividers);
         }
     }
     (panes, dividers)
@@ -123,6 +230,7 @@ fn first(node: &ViewLayoutNode) -> Option<&str> {
 fn walk(
     node: &ViewLayoutNode,
     rect: [f64; 4],
+    layer_index: usize,
     drag: Option<(&str, f64)>,
     panes: &mut Vec<Placement>,
     dividers: &mut Vec<Divider>,
@@ -131,6 +239,7 @@ fn walk(
         panes.push(Placement {
             block: block.clone(),
             rect,
+            layer_index,
         });
         return;
     }
@@ -156,6 +265,7 @@ fn walk(
             horizontal,
             rect,
             ratio,
+            layer_index,
         });
     }
     let [x, y, w, h] = rect;
@@ -170,8 +280,8 @@ fn walk(
             [x, y + h * ratio, w, h * (1. - ratio)],
         )
     };
-    walk(before, a, drag, panes, dividers);
-    walk(after, b, drag, panes, dividers);
+    walk(before, a, layer_index, drag, panes, dividers);
+    walk(after, b, layer_index, drag, panes, dividers);
 }
 
 /// Proposed resize requests that give each branch in a same-direction chain equal space.
@@ -207,6 +317,7 @@ pub fn balanced(window: &Window) -> Vec<Divider> {
     }
     let mut proposal = window.clone();
     proposal.zoomed_block_id = None;
+    proposal.tiled_zoomed_block_id = None;
     for layer in &mut proposal.layers {
         if let Some(node) = &mut layer.layout {
             balance(node);
@@ -255,29 +366,39 @@ pub const RATIO_RANGE: (f64, f64) = (0.1, 0.9);
 const SAME: f64 = 1e-6;
 
 /// The panes and borders of the layer `block` is in, as the server laid them out. None while
-/// a pane is zoomed, since no other pane is beside it then, or while its layer is minimized.
+/// a full-window zoom is active, while `block` is in a zoomed tiled layer, or while its layer
+/// is minimized.
 fn beside(window: &Window, block: &str) -> Option<(Vec<Placement>, Vec<Divider>)> {
-    if window.zoomed_block_id.is_some() {
+    if full_window_zoom(window).is_some() {
         return None;
     }
-    window.layers.iter().find_map(|layer| {
-        if layer.state.as_deref() == Some("minimized") {
-            return None;
-        }
-        let (mut panes, mut dividers) = (Vec::new(), Vec::new());
-        // Only how panes lie against each other matters here, so the layer's own bounds do not.
-        walk(
-            layer.layout.as_ref()?,
-            [0., 0., 1., 1.],
-            None,
-            &mut panes,
-            &mut dividers,
-        );
-        panes
-            .iter()
-            .any(|pane| pane.block == block)
-            .then_some((panes, dividers))
-    })
+    let tiled_zoomed = tiled_zoom(window).is_some();
+    window
+        .layers
+        .iter()
+        .enumerate()
+        .find_map(|(layer_index, layer)| {
+            if layer.state.as_deref() == Some("minimized") {
+                return None;
+            }
+            if tiled_zoomed && layer.kind == "tiled" {
+                return None;
+            }
+            let (mut panes, mut dividers) = (Vec::new(), Vec::new());
+            // Only how panes lie against each other matters here, so the layer's own bounds do not.
+            walk(
+                layer.layout.as_ref()?,
+                [0., 0., 1., 1.],
+                layer_index,
+                None,
+                &mut panes,
+                &mut dividers,
+            );
+            panes
+                .iter()
+                .any(|pane| pane.block == block)
+                .then_some((panes, dividers))
+        })
 }
 
 /// The pane that lies against `side` of `block` in the server's layout: of several, the one
@@ -515,5 +636,192 @@ mod tests {
         // Stepping there and back leaves no rounding noise in the ratio.
         assert_eq!(resized(&at(0.3), "a", Side::Right).unwrap().ratio, 0.35);
         assert_eq!(resized(&at(0.35), "a", Side::Left).unwrap().ratio, 0.3);
+    }
+
+    #[test]
+    fn placements_and_dividers_carry_their_layer_index() {
+        let window: Window = serde_json::from_value(json!({"layers":[
+            {"kind":"tiled","bounds":[0,0,1,1],
+             "layout":{"split":{"direction":"horizontal","ratio":0.5,
+                "before":{"block_id":"t1"},"after":{"block_id":"t2"}}}},
+            {"kind":"floating","state":"minimized","bounds":[0.1,0.1,0.4,0.4],
+             "layout":{"block_id":"hidden"}},
+            {"kind":"floating","bounds":[0.2,0.15,0.6,0.6],
+             "layout":{"split":{"direction":"vertical","ratio":0.5,
+                "before":{"block_id":"f1"},"after":{"block_id":"f2"}}}}
+        ]}))
+        .unwrap();
+        let (panes, dividers) = placements(&window, None);
+        let pane_layers: Vec<(&str, usize)> = panes
+            .iter()
+            .map(|p| (p.block.as_str(), p.layer_index))
+            .collect();
+        assert_eq!(pane_layers, [("t1", 0), ("t2", 0), ("f1", 2), ("f2", 2)]);
+        let divider_layers: Vec<(String, usize)> =
+            dividers.iter().map(|d| (d.key(), d.layer_index)).collect();
+        assert_eq!(divider_layers, [("t1:t2".into(), 0), ("f1:f2".into(), 2)]);
+    }
+
+    #[test]
+    fn dual_zoom_covers_all_four_cases() {
+        let base: Window = serde_json::from_value(json!({"layers":[
+            {"kind":"tiled","bounds":[0,0,1,1],
+             "layout":{"split":{"direction":"horizontal","ratio":0.5,
+                "before":{"block_id":"t1"},"after":{"block_id":"t2"}}},
+             "blocks":[{"block_id":"t1"},{"block_id":"t2"}]},
+            {"kind":"floating","state":"minimized","bounds":[0.05,0.05,0.4,0.4],
+             "layout":{"block_id":"hidden"},
+             "blocks":[{"block_id":"hidden"}]},
+            {"kind":"floating","bounds":[0.2,0.15,0.6,0.6],
+             "layout":{"split":{"direction":"vertical","ratio":0.5,
+                "before":{"block_id":"f1"},"after":{"block_id":"f2"}}},
+             "blocks":[{"block_id":"f1"},{"block_id":"f2"}]}
+        ]}))
+        .unwrap();
+
+        // 1. No zoom.
+        assert_eq!(full_window_zoom(&base), None);
+        assert_eq!(tiled_zoom(&base), None);
+        assert!(!any_zoomed(&base));
+        assert!(!is_zoomed(&base, "t1"));
+        assert!(block_visible(&base, &base.layers[0], "t1"));
+        assert!(block_visible(&base, &base.layers[0], "t2"));
+        assert!(!block_visible(&base, &base.layers[1], "hidden"));
+        assert!(block_visible(&base, &base.layers[2], "f1"));
+
+        // 2. Legacy API 10-20 zoom (`zoomed_block_id` set, `tiled_zoomed_block_id` absent).
+        let mut legacy = base.clone();
+        legacy.zoomed_block_id = Some("t1".into());
+        assert_eq!(full_window_zoom(&legacy), Some("t1"));
+        assert_eq!(tiled_zoom(&legacy), None);
+        assert!(any_zoomed(&legacy));
+        assert!(is_zoomed(&legacy, "t1"));
+        assert!(!is_zoomed(&legacy, "f1"));
+        let (panes, dividers) = placements(&legacy, None);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].block, "t1");
+        assert_eq!(panes[0].rect, [0., 0., 1., 1.]);
+        assert!(dividers.is_empty());
+        assert!(block_visible(&legacy, &legacy.layers[0], "t1"));
+        assert!(!block_visible(&legacy, &legacy.layers[0], "t2"));
+        assert!(!block_visible(&legacy, &legacy.layers[2], "f1"));
+        assert_eq!(neighbour(&legacy, "f1", Side::Down), None);
+
+        // 3. API 21 tiled zoom: both when tiled block is focused (`zoomed == tiled_zoomed`)
+        //    and when a floating block is focused (`zoomed == None`, `tiled_zoomed == Some`).
+        for zoomed_field in [Some("t1".into()), None] {
+            let mut tiled_only = base.clone();
+            tiled_only.zoomed_block_id = zoomed_field;
+            tiled_only.tiled_zoomed_block_id = Some("t1".into());
+            assert_eq!(full_window_zoom(&tiled_only), None);
+            assert_eq!(tiled_zoom(&tiled_only), Some("t1"));
+            assert!(any_zoomed(&tiled_only));
+            assert!(is_zoomed(&tiled_only, "t1"));
+            assert!(!is_zoomed(&tiled_only, "t2"));
+            assert!(!is_zoomed(&tiled_only, "f1"));
+
+            let (panes, dividers) = placements(&tiled_only, None);
+            assert_eq!(
+                panes
+                    .iter()
+                    .map(|p| (p.block.as_str(), p.layer_index))
+                    .collect::<Vec<_>>(),
+                [("t1", 0), ("f1", 2), ("f2", 2)]
+            );
+            assert_eq!(panes[0].rect, [0., 0., 1., 1.]);
+            for (got, want) in panes[1].rect.iter().zip([0.2, 0.15, 0.6, 0.3]) {
+                assert!((got - want).abs() < 1e-9, "{got} != {want}");
+            }
+            for (got, want) in panes[2].rect.iter().zip([0.2, 0.45, 0.6, 0.3]) {
+                assert!((got - want).abs() < 1e-9, "{got} != {want}");
+            }
+            assert_eq!(
+                dividers
+                    .iter()
+                    .map(|d| (d.key(), d.layer_index))
+                    .collect::<Vec<_>>(),
+                [("f1:f2".into(), 2)]
+            );
+            assert!(block_visible(&tiled_only, &tiled_only.layers[0], "t1"));
+            assert!(!block_visible(&tiled_only, &tiled_only.layers[0], "t2"));
+            assert!(!block_visible(&tiled_only, &tiled_only.layers[1], "hidden"));
+            assert!(block_visible(&tiled_only, &tiled_only.layers[2], "f1"));
+            assert!(block_visible(&tiled_only, &tiled_only.layers[2], "f2"));
+            // Tiled neighbours/resize are blocked; floating split neighbours/resize still work.
+            assert_eq!(neighbour(&tiled_only, "t1", Side::Right), None);
+            assert!(resized(&tiled_only, "t1", Side::Right).is_none());
+            assert_eq!(
+                neighbour(&tiled_only, "f1", Side::Down).as_deref(),
+                Some("f2")
+            );
+            assert!(resized(&tiled_only, "f1", Side::Down).is_some());
+            // `balanced` clears both zoom fields and balances every visible layer.
+            let bal = balanced(&tiled_only);
+            assert_eq!(bal.len(), 2);
+        }
+
+        // 4. API 21 floating zoom (with or without a tiled zoom behind it) covers every layer.
+        for tiled_field in [None, Some("t1".into())] {
+            let mut float_zoom = base.clone();
+            float_zoom.zoomed_block_id = Some("f1".into());
+            float_zoom.tiled_zoomed_block_id = tiled_field;
+            assert_eq!(full_window_zoom(&float_zoom), Some("f1"));
+            assert_eq!(tiled_zoom(&float_zoom), None);
+            assert!(any_zoomed(&float_zoom));
+            assert!(is_zoomed(&float_zoom, "f1"));
+            let (panes, dividers) = placements(&float_zoom, None);
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].block, "f1");
+            assert_eq!(panes[0].layer_index, 2);
+            assert_eq!(panes[0].rect, [0., 0., 1., 1.]);
+            assert!(dividers.is_empty());
+            assert!(!block_visible(&float_zoom, &float_zoom.layers[0], "t1"));
+            assert!(block_visible(&float_zoom, &float_zoom.layers[2], "f1"));
+            assert!(!block_visible(&float_zoom, &float_zoom.layers[2], "f2"));
+            assert_eq!(neighbour(&float_zoom, "f1", Side::Down), None);
+        }
+    }
+
+    #[test]
+    fn stale_tiled_zoomed_block_id_falls_back_to_tiled_layout() {
+        let base: Window = serde_json::from_value(json!({"layers":[
+            {"kind":"tiled","bounds":[0,0,1,1],
+             "layout":{"split":{"direction":"horizontal","ratio":0.5,
+                "before":{"block_id":"t1"},"after":{"block_id":"t2"}}}},
+            {"kind":"floating","bounds":[0.2,0.15,0.6,0.6],
+             "layout":{"block_id":"f1"}}
+        ]}))
+        .unwrap();
+
+        // Works when `blocks` is omitted and the block exists in the tiled layout tree.
+        let mut valid_from_tree = base.clone();
+        valid_from_tree.tiled_zoomed_block_id = Some("t1".into());
+        assert_eq!(tiled_zoom(&valid_from_tree), Some("t1"));
+
+        // Stale block ID (missing from tiled layer) or ID belonging only to a floating layer
+        // must fall back cleanly to the normal tiled layout instead of hiding every tiled pane.
+        for (zoomed, stale) in [(None, "gone"), (Some("gone"), "gone"), (None, "f1")] {
+            let mut window = base.clone();
+            window.zoomed_block_id = zoomed.map(str::to_owned);
+            window.tiled_zoomed_block_id = Some(stale.into());
+            assert_eq!(tiled_zoom(&window), None);
+            assert!(!any_zoomed(&window));
+            assert!(!is_zoomed(&window, stale));
+            let (panes, dividers) = placements(&window, None);
+            assert_eq!(
+                panes.iter().map(|p| p.block.as_str()).collect::<Vec<_>>(),
+                ["t1", "t2", "f1"]
+            );
+            assert_eq!(dividers.len(), 1);
+            assert!(block_visible(&window, &window.layers[0], "t1"));
+            assert!(block_visible(&window, &window.layers[0], "t2"));
+            assert_eq!(neighbour(&window, "t1", Side::Right).as_deref(), Some("t2"));
+        }
+
+        // Minimized tiled layer does not satisfy tiled_zoom either.
+        let mut min_tiled = base.clone();
+        min_tiled.layers[0].state = Some("minimized".into());
+        min_tiled.tiled_zoomed_block_id = Some("t1".into());
+        assert_eq!(tiled_zoom(&min_tiled), None);
     }
 }

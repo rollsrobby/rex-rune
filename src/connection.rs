@@ -6,10 +6,10 @@ use crate::{
 };
 use activity::{BlockEvent, DesktopNotice, StatusRecord, TerminalProgress};
 use anyhow::{Context, Result};
-use rexrs::api::{BlockMethod, session, terminal::SetTheme};
+use rexrs::api::{BlockMethod, Method, session, terminal::SetTheme};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -19,10 +19,22 @@ pub mod activity;
 pub mod clipboard;
 pub mod directory;
 pub mod downloads;
+pub mod focus_history;
+pub mod hosts;
+pub mod ports;
 mod prefetch;
 pub mod server_info;
 mod status_sweep;
 pub mod titles;
+mod view_fetch;
+
+pub use focus_history::{
+    FOCUS_HISTORY_DISCONNECTED, FOCUS_HISTORY_DISCONNECTED_NOTICE, FOCUS_HISTORY_EMPTY_NOTICE,
+    FOCUS_HISTORY_EXPIRED_NOTICE, FOCUS_HISTORY_MIN_API_REVISION, FOCUS_HISTORY_REQUIRES_API,
+    FOCUS_HISTORY_SYNC_TIMEOUT_NOTICE, FOCUS_HISTORY_UNSUPPORTED_NOTICE, FocusHistoryResult,
+    FocusHistoryScope,
+};
+pub use view_fetch::ViewFetchOutcome;
 
 /// The label new tabs get. A tab that still has it shows its program's terminal title.
 pub const DEFAULT_TAB_LABEL: &str = "Shell";
@@ -137,9 +149,11 @@ fn parse_font_size(value: &str) -> std::result::Result<f32, String> {
 pub mod actions;
 pub mod keymap;
 pub mod perform;
+pub mod prompt;
 
 pub enum Command {
     Selection(crate::terminal::selection::Input),
+    CopyMode(crate::terminal::copy_mode::CopyModeInput),
     Key(Value),
     KeyWithPrefix {
         key: Value,
@@ -185,6 +199,13 @@ pub struct Model {
     pub input_events: u64,
     /// Words for the user from the pane's worker (a failed search), taken once shown.
     pub notice: Option<String>,
+    /// Latest completed copy-mode yank (`Yank` / `YankLine`), taken once by the UI so a
+    /// fast `Yank` followed by `End` never races with selection clearing.
+    pub copy_yank: Option<crate::terminal::copy_mode::CopyYank>,
+    /// Highest copy-mode epoch ended automatically by the pane worker (screen switch,
+    /// lost tracked reference, or fresh snapshot/reconnect); monotonic so the UI
+    /// reconciles once.
+    pub copy_ended_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -242,8 +263,8 @@ const STOP_ACCEPTED: &str = "Server stop accepted. Rex Rune will not start it ag
 
 #[derive(Clone, Default)]
 pub struct HostModel {
-    /// A successful SSH lookup found no default server; setup may be offered, never run.
-    pub ssh_server_missing: bool,
+    /// Setup problems from the last read-only SSH lookup.
+    pub ssh_problem: Option<crate::ssh::Problem>,
     pub visible: bool,
     pub connected: bool,
     pub status: String,
@@ -255,6 +276,10 @@ pub struct HostModel {
     /// Taken once before cloning the worker model into the UI.
     pub client_actions: Vec<actions::Queued>,
     pub performs: Vec<perform::Pending>,
+    /// Epoch-scoped prompt transitions, oldest first; drain once in the consumer.
+    pub prompt_events: VecDeque<prompt::PromptEvent>,
+    /// Number of `client.action` calls currently awaiting a server response on this connection.
+    pub actions_in_flight: usize,
     /// This launch's downloads from the host, oldest first; see [`crate::download`].
     pub downloads: Vec<crate::download::Transfer>,
     pub connection_epoch: u64,
@@ -265,6 +290,10 @@ pub struct HostModel {
     pub selected: Option<String>,
     /// Completion of the latest client navigation request (id, success), not a notice.
     pub navigation_result: Option<(u64, bool)>,
+    /// Completion of the latest `focus_history.reverse` request on this connection epoch.
+    pub focus_history_result: Option<FocusHistoryResult>,
+    /// Completed on-demand read-only session view fetches, drained once by the UI.
+    pub view_fetches: Vec<(u64, ViewFetchOutcome)>,
     /// Most recent read-only directory reply; only its browser/request may consume it.
     pub directory: Option<Arc<directory::Reply>>,
     pub views: HashMap<String, session::ViewResponse>,
@@ -311,6 +340,18 @@ pub struct HostModel {
     pub theme_declared: bool,
     /// What the server says about itself; see [`server_info`].
     pub server_info: server_info::ServerInfo,
+    /// Shared host list from this server (`hosts.list` / `hosts_changed`).
+    pub shared: hosts::SharedHostState,
+    /// Bumped whenever `shared` updates from a `hosts.list` reply.
+    pub shared_revision: u64,
+    /// Completed shared-host write outcomes (`hosts.put` / `hosts.remove`), taken once by the UI.
+    pub shared_writes: Vec<hosts::WriteResult>,
+    /// Listening TCP ports last read or reported for each terminal block in a held view.
+    pub ports: HashMap<String, crate::ports::PortSnapshot>,
+    /// Terminal blocks with an on-demand `com.superlogical.terminal.ports` read in flight or queued.
+    pub ports_reading: HashSet<String>,
+    /// Monotonic count of completed `com.superlogical.terminal.ports` reads on this connection.
+    pub ports_read_completions: u64,
 }
 impl HostModel {
     /// Record a block's owner (none when nobody owns it), in its session's view and its pane.
@@ -435,6 +476,7 @@ impl HostModel {
     }
     fn forget_block(&mut self, block: &str) {
         self.activity.remove(block);
+        self.status_read.remove(block);
         self.programs.remove(block);
         self.executables.remove(block);
         self.scripts.remove(block);
@@ -442,6 +484,8 @@ impl HostModel {
         self.titles.remove(block);
         self.places.remove(block);
         self.progress.remove(block);
+        self.ports.remove(block);
+        self.ports_reading.remove(block);
     }
 
     /// The block's terminal title while it's current. Shells rarely clear a title when the
@@ -470,7 +514,46 @@ impl HostModel {
     }
 }
 
+pub const UNDO_CLOSE_MIN_API_REVISION: u32 = 20;
+pub const UNDO_CLOSE_REQUIRES_API: &str = "Requires Rex Server API 20 or later";
+pub const UNDO_CLOSE_DISCONNECTED: &str = "Connect to the host to undo a close";
+
+/// Only the close methods that accept `undoable`. Probes and automated requests use `Request`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HumanClose {
+    Pane,
+    Tab,
+    Session,
+}
+
+impl HumanClose {
+    pub fn method(self) -> &'static str {
+        match self {
+            Self::Pane => "block.close",
+            Self::Tab => "session.close_window",
+            Self::Session => "session.destroy",
+        }
+    }
+}
+
 pub enum HostCommand {
+    Close {
+        kind: HumanClose,
+        payload: Value,
+    },
+    /// Undo only on the connection the person asked on, with no replay.
+    UndoClose {
+        epoch: u64,
+    },
+    /// Step back through server-side focus history on this connection epoch only (API 19+).
+    /// Never replayed across disconnect/reconnect or sent past `deadline`.
+    ReverseFocusHistory {
+        epoch: u64,
+        id: u64,
+        scope: FocusHistoryScope,
+        cursor: Option<u64>,
+        deadline: Instant,
+    },
     /// A person's confirmed, single attempt on this connection only. Never replayed.
     StopServer {
         epoch: u64,
@@ -480,10 +563,47 @@ pub enum HostCommand {
         call_id: String,
         outcome: perform::Outcome,
     },
+    /// Opt in only while a prompt consumer is available. Off by default.
+    Prompts(bool),
+    /// Answer an offered prompt on the same connection, never replayed.
+    PromptReply {
+        epoch: u64,
+        call_id: String,
+        answer: prompt::PromptAnswer,
+    },
     Keymap(Box<keymap::Declaration>),
     /// Read the server's version once on each connection from now on, and its status again
     /// when the server says it changed; see [`server_info`]. Read-only, and a refusal is quiet.
     Identify,
+    /// Read `hosts.list` once per connection and re-read on `hosts_changed`; see [`hosts`].
+    WatchSharedHosts,
+    /// Open or close on-demand listening-port inspection for `session` on `epoch` only (API 15+).
+    /// `Some(session)` starts reads for that session's terminal blocks and enables `event_dropped`
+    /// re-reads for it; `None` clears the watched session and cancels in-flight port reads.
+    WatchPorts {
+        epoch: u64,
+        session: Option<String>,
+    },
+    /// One-shot on-demand listening-port read for `session`'s terminal blocks on `epoch` only
+    /// (API 15+), without changing the watched session.
+    ReadPorts {
+        epoch: u64,
+        session: String,
+    },
+    /// Create or update one host in this server's shared host list (`hosts.put`) on `epoch` only.
+    /// Never auto-retried or queued across reconnects.
+    PutSharedHost {
+        id: u64,
+        epoch: u64,
+        host: Value,
+    },
+    /// Remove one host from this server's shared host list (`hosts.remove`) on `epoch` only.
+    /// Never auto-retried or queued across reconnects.
+    RemoveSharedHost {
+        id: u64,
+        epoch: u64,
+        host_id: String,
+    },
     Action {
         generation: u64,
         request: Box<rexrs::api::client::Action>,
@@ -510,6 +630,14 @@ pub enum HostCommand {
     /// The sessions whose views to load in the background, for listing their tabs; empty
     /// stops loading.
     PrefetchViews(HashSet<String>),
+    /// Read-only `session.view` fetch for a listed unloaded session, without attaching or
+    /// selecting it.
+    FetchView {
+        id: u64,
+        epoch: u64,
+        deadline: Instant,
+        session: String,
+    },
     /// A new session: the server picks a unique label when `label` is none; `shell` starts
     /// its first terminal.
     CreateSession {
@@ -519,6 +647,16 @@ pub enum HostCommand {
     Request {
         method: String,
         payload: Value,
+    },
+    /// Move or resize a floating layer on this connection epoch only (API revision 13).
+    /// Checked against the live epoch and negotiated API revision right before sending; never
+    /// replayed across disconnect/reconnect.
+    ResizeLayer {
+        epoch: u64,
+        session: String,
+        layer: String,
+        bounds: [f64; 4],
+        raise_first: bool,
     },
     /// Explicit tab/split creation, inheriting the named source block's shell directory.
     /// A failed or slow read leaves the server's default starting directory unchanged.
@@ -546,6 +684,13 @@ pub enum HostCommand {
     DownloadConfirm(u64),
     /// Stop a download at any point; its partial file is deleted.
     DownloadCancel(u64),
+    /// Update `SSH_AUTH_SOCK` for future SSH runs on this host without dropping live
+    /// connections. When `wake_auth_retry` is true and this is a disconnected `ssh://` host
+    /// whose last error was `Problem::AuthFailed`, cut short backoff and retry immediately.
+    SshAgent {
+        socket: Option<PathBuf>,
+        wake_auth_retry: bool,
+    },
     Reconnect,
     /// The terminal theme to declare from now on, also while disconnected; none declares
     /// nothing (Follow server).
@@ -573,9 +718,14 @@ struct PendingTicket {
 struct ControlState {
     // Earliest possible arrival of events buffered during the preceding busy step.
     performs_since: Option<Instant>,
+    prompts_enabled: bool,
+    prompts: prompt::PromptState,
+    actions: actions::Waits,
     bootstrap_seq: u64,
     list_seq: u64,
     view_seq: HashMap<String, u64>,
+    /// Sessions attached on this control connection (via `session.bootstrap` or `session.attach`).
+    attached: HashSet<String>,
     /// Blocks whose title and initial process metadata were asked for.
     queried: HashSet<String>,
     status_queried: HashSet<String>,
@@ -593,14 +743,37 @@ struct ControlState {
     /// meanwhile: that change was ignored for want of a layout, so it is read once more.
     view_reading: Option<String>,
     view_stale: bool,
+    /// Sessions with an in-flight on-demand `FetchView` whose layout changed meanwhile.
+    fetch_reading: HashSet<String>,
+    fetch_stale: HashSet<String>,
     /// The theme last declared to each block on this connection.
     themed: HashMap<String, SetTheme>,
     // This pool is scoped to the terminal data ref and subprotocol; other sources
     // are filtered out before insertion. It lives only as long as this control socket.
     tickets: HashMap<(String, String), PendingTicket>,
+    /// Highest control `seq` applied to each block's listening-ports snapshot.
+    ports_seq: HashMap<String, u64>,
+    /// On-demand detached `com.superlogical.terminal.ports` reader for this connection.
+    ports_reads: ports::Reader,
 }
 
 impl ControlState {
+    async fn prompt_event(
+        &mut self,
+        control: &mut Client,
+        shared: &Shared,
+        event: rexrs::Event,
+    ) -> Result<()> {
+        if let Some(deadline) = self
+            .prompts
+            .event(control, shared, self.prompts_enabled, event)
+            .await?
+        {
+            self.actions.promote(deadline);
+        }
+        Ok(())
+    }
+
     fn add_tickets(&mut self, tickets: Vec<session::DataTicket>, started: Instant) {
         for ticket in tickets {
             if ticket.data_ref_id != "terminal"
@@ -646,18 +819,64 @@ impl ControlState {
         });
     }
 
+    fn forget_block(&mut self, block: &str) {
+        self.queried.remove(block);
+        self.status_queried.remove(block);
+        self.status_failed.remove(block);
+        self.status_reading.remove(block);
+        self.themed.remove(block);
+        self.tickets.retain(|(_, b), _| b != block);
+        self.ports_seq.remove(block);
+        self.ports_reads.cancel_block(block);
+    }
+
+    fn forget_session(&mut self, id: &str, blocks: impl IntoIterator<Item = String>) {
+        self.view_seq.remove(id);
+        self.attached.remove(id);
+        self.viewed.remove(id);
+        self.urgent_views.retain(|s| s != id);
+        if self.view_reading.as_deref() == Some(id) {
+            self.view_stale = true;
+        }
+        self.fetch_stale.remove(id);
+        self.tickets.retain(|(s, _), _| s != id);
+        self.ports_reads.cancel_session(id);
+        for block in blocks {
+            self.forget_block(&block);
+        }
+    }
+
     fn includes(&self, event: &rexrs::Event) -> bool {
         let mut floor = self.bootstrap_seq;
-        if matches!(
-            event.name.as_str(),
-            "session_created" | "session_moved" | "session_destroyed" | "session_label_changed"
-        ) {
+        let event_type = if event.name == "event_dropped" {
+            event.payload["event_type"].as_str().unwrap_or("")
+        } else {
+            event.name.as_str()
+        };
+        let list_event = matches!(
+            event_type,
+            "session_created" | "session_moved" | "session_destroyed"
+        );
+        if list_event || event_type == "session_label_changed" {
             floor = floor.max(self.list_seq);
         }
-        // Views contain state, not transient clipboard events.
-        if event.name != "session_destroyed"
-            && !(event.name == "block_event" && clipboard::is_copy(&event.payload))
-            && let Some(id) = &event.session_id
+        // Views contain state, not transient clipboard events, ports_changed events, or
+        // list-level session events.
+        let session = event.session_id.as_deref().or_else(|| {
+            (event.name == "event_dropped")
+                .then(|| event.payload["session_id"].as_str())
+                .flatten()
+        });
+        let is_copy = event.name == "block_event" && clipboard::is_copy(&event.payload);
+        let is_ports = event.name == "block_event" && ports::is_ports_changed(&event.payload);
+        // `session.view` carries layout, not program status, title, or process metadata, so
+        // only `session_view_changed` drops are superseded by a newer `view_seq`.
+        let view_covered = event.name != "event_dropped" || event_type == "session_view_changed";
+        if !list_event
+            && !is_copy
+            && !is_ports
+            && view_covered
+            && let Some(id) = session
         {
             floor = floor.max(self.view_seq.get(id).copied().unwrap_or(0));
         }
@@ -740,8 +959,13 @@ impl Shared {
             m.connected = connected;
             if !connected {
                 m.clipboard = None;
+                m.prompt_events.clear();
+                m.actions_in_flight = 0;
                 m.keymap = None;
                 m.keymap_revision += 1;
+                m.ports.clear();
+                m.ports_reading.clear();
+                m.focus_history_result = None;
             }
             for terminal in m.terminals.values() {
                 terminal
@@ -778,6 +1002,7 @@ impl PaneShared {
 enum DataCommand {
     CursorStyle(crate::terminal::CursorShape),
     Selection(crate::terminal::selection::Input),
+    CopyMode(crate::terminal::copy_mode::CopyModeInput),
     Visible(bool),
     Scroll(isize),
     Search(String),
@@ -868,6 +1093,100 @@ impl HostConnection {
         theme: Option<SetTheme>,
         label: String,
     ) -> Self {
+        Self::spawn_with_ssh_agent(
+            endpoint, preferred, create, block, visible, theme, label, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_ssh_agent(
+        endpoint: String,
+        preferred: Option<String>,
+        create: Option<(String, Option<String>)>,
+        block: Option<String>,
+        visible: bool,
+        theme: Option<SetTheme>,
+        label: String,
+        ssh_auth_sock: Option<PathBuf>,
+    ) -> Self {
+        Self::spawn_with_prompts(
+            endpoint,
+            preferred,
+            create,
+            block,
+            visible,
+            theme,
+            label,
+            ssh_auth_sock,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_prompts(
+        endpoint: String,
+        preferred: Option<String>,
+        create: Option<(String, Option<String>)>,
+        block: Option<String>,
+        visible: bool,
+        theme: Option<SetTheme>,
+        label: String,
+        ssh_auth_sock: Option<PathBuf>,
+        prompts_enabled: bool,
+    ) -> Self {
+        Self::spawn_internal(
+            endpoint,
+            Startup {
+                preferred,
+                create,
+                block,
+                theme,
+                label,
+                ssh_auth_sock,
+                prompts_enabled,
+                max_api_revision: transport::API_REVISION,
+                #[cfg(test)]
+                ssh_program: None,
+                #[cfg(test)]
+                tunnel_dir: None,
+            },
+            visible,
+        )
+    }
+
+    /// Spawn a host worker offering at most `max_api_revision` in HELLO (clamped to
+    /// `MIN_API_REVISION..=API_REVISION`). Used by protocol probes to verify lower-revision
+    /// behavior against live servers.
+    pub fn spawn_with_max_revision(
+        endpoint: String,
+        preferred: Option<String>,
+        create: Option<(String, Option<String>)>,
+        block: Option<String>,
+        visible: bool,
+        theme: Option<SetTheme>,
+        max_api_revision: u32,
+    ) -> Self {
+        Self::spawn_internal(
+            endpoint,
+            Startup {
+                preferred,
+                create,
+                block,
+                theme,
+                label: crate::settings::hostname(),
+                ssh_auth_sock: None,
+                prompts_enabled: false,
+                max_api_revision,
+                #[cfg(test)]
+                ssh_program: None,
+                #[cfg(test)]
+                tunnel_dir: None,
+            },
+            visible,
+        )
+    }
+
+    fn spawn_internal(endpoint: String, startup: Startup, visible: bool) -> Self {
         let model = Arc::new(Mutex::new(HostModel {
             visible,
             status: "Connecting…".into(),
@@ -880,13 +1199,6 @@ impl HostConnection {
             wake,
         };
         let sender = commands.clone();
-        let startup = Startup {
-            preferred,
-            create,
-            block,
-            theme,
-            label,
-        };
         let alive = HostThread(Arc::as_ptr(&model) as usize);
         running_hosts().push(alive.0);
         std::thread::Builder::new()
@@ -938,49 +1250,108 @@ async fn attach(
     control: &mut Client,
     shared: &Shared,
     state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
     id: &str,
 ) -> Result<()> {
+    attach_within(control, shared, state, sweep, id, Duration::from_secs(8)).await
+}
+
+async fn attach_within(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    id: &str,
+    timeout: Duration,
+) -> Result<()> {
     shared.update(|m| m.protocol.attach_requests += 1);
-    let reply = tokio::time::timeout(
-        Duration::from_secs(8),
-        control.call_with_seq(session::Attach::new(id)),
-    )
-    .await??;
+    let reply =
+        tokio::time::timeout(timeout, control.call_with_seq(session::Attach::new(id))).await??;
     state.view_seq.insert(id.into(), reply.seq);
-    apply_view(shared, id, reply.value.view);
+    state.attached.insert(id.into());
+    replace_view(shared, state, sweep, id, reply.value.view);
     Ok(())
 }
 fn apply_view(shared: &Shared, id: &str, view: session::ViewResponse) {
+    shared.update(|m| apply_view_to_model(m, id, view));
+}
+
+fn replace_view(
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    id: &str,
+    view: session::ViewResponse,
+) {
     shared.update(|m| {
-        if m.views
-            .get(id)
-            .is_some_and(|old| old.revision > view.revision)
-        {
-            return;
-        }
-        if let Some(label) = &view.label
-            && let Some(s) = m.sessions.iter_mut().find(|s| s.session_id == id)
-        {
-            s.label = label.clone();
-        }
-        for block in view
-            .windows
-            .iter()
-            .flat_map(|w| &w.layers)
-            .flat_map(|l| &l.blocks)
-        {
-            if let Some(connection) = block.block_id.as_ref().and_then(|id| m.terminals.get(id)) {
-                connection.model.lock().expect("terminal model").owner =
-                    block.owner.as_deref() == Some(&m.client_id);
+        let mut added = Vec::new();
+        if let Some(old) = m.views.get(id) {
+            if old.revision > view.revision {
+                return;
+            }
+            let previous: HashSet<_> = view_blocks(old).collect();
+            let current: HashSet<_> = view_blocks(&view).collect();
+            let gone: Vec<_> = previous.difference(&current).cloned().collect();
+            added = current.difference(&previous).cloned().collect();
+            for block in gone {
+                // An undoable close removes the block from the view and ends its stream
+                // now, but does not deliver a control block_closed event while it is held.
+                // Reconcile drops the worker; clear these reads even for unstreamed blocks.
+                sweep.cancel_block(&block);
+                state.forget_block(&block);
+                m.forget_block(&block);
             }
         }
-        m.views.insert(id.into(), view);
+        apply_view_to_model(m, id, view);
+        if !added.is_empty() {
+            state.ports_reads.enqueue_new_watched_blocks(m, id, added);
+        }
     });
+}
+
+fn apply_view_to_model(m: &mut HostModel, id: &str, view: session::ViewResponse) {
+    if m.views
+        .get(id)
+        .is_some_and(|old| old.revision > view.revision)
+    {
+        return;
+    }
+    if let Some(label) = &view.label
+        && let Some(s) = m.sessions.iter_mut().find(|s| s.session_id == id)
+    {
+        s.label = label.clone();
+    }
+    for block in view
+        .windows
+        .iter()
+        .flat_map(|w| &w.layers)
+        .flat_map(|l| &l.blocks)
+    {
+        if let Some(connection) = block.block_id.as_ref().and_then(|id| m.terminals.get(id)) {
+            connection.model.lock().expect("terminal model").owner =
+                block.owner.as_deref() == Some(&m.client_id);
+        }
+    }
+    m.views.insert(id.into(), view);
+}
+
+const VIEW_FETCH_CAP: usize = 64;
+
+fn record_view_fetches(
+    m: &mut HostModel,
+    entries: impl IntoIterator<Item = (u64, ViewFetchOutcome)>,
+) {
+    m.view_fetches.extend(entries);
+    if m.view_fetches.len() > VIEW_FETCH_CAP {
+        let extra = m.view_fetches.len() - VIEW_FETCH_CAP;
+        m.view_fetches.drain(..extra);
+    }
 }
 async fn refresh(
     control: &mut Client,
     shared: &Shared,
     state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
     id: &str,
 ) -> Result<()> {
     let reply = tokio::time::timeout(
@@ -989,27 +1360,122 @@ async fn refresh(
     )
     .await??;
     state.view_seq.insert(id.into(), reply.seq);
-    apply_view(shared, id, reply.value);
+    replace_view(shared, state, sweep, id, reply.value);
     Ok(())
 }
-async fn list(control: &mut Client, shared: &Shared, state: &mut ControlState) -> Result<()> {
+
+/// Read an already-attached session's view via `session.attach` rather than `session.view`.
+/// On API 19+, `session.view` records focus in the server's focus history while
+/// `session.attach` returns the full fresh view without altering focus history.
+async fn refresh_background(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    id: &str,
+) -> Result<()> {
+    refresh_background_within(control, shared, state, sweep, id, Duration::from_secs(8)).await
+}
+
+async fn refresh_background_within(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let reply =
+        tokio::time::timeout(timeout, control.call_with_seq(session::Attach::new(id))).await??;
+    state.view_seq.insert(id.into(), reply.seq);
+    state.attached.insert(id.into());
+    replace_view(shared, state, sweep, id, reply.value.view);
+    Ok(())
+}
+
+/// Refresh `id`'s view for a passive event or post-request sync without altering
+/// server-side focus history when this connection is already attached to `id` on API 19+.
+/// Unattached sessions keep using `session.view` so Rex Rune never joins unopened or
+/// explicitly detached sessions.
+async fn refresh_for_event(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    id: &str,
+) -> Result<()> {
+    if control.welcome().api_revision >= FOCUS_HISTORY_MIN_API_REVISION
+        && state.attached.contains(id)
+    {
+        refresh_background(control, shared, state, sweep, id).await
+    } else {
+        refresh(control, shared, state, sweep, id).await
+    }
+}
+async fn list(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+) -> Result<()> {
+    list_within(control, shared, state, sweep, Duration::from_secs(8)).await
+}
+
+async fn list_within(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    timeout: Duration,
+) -> Result<()> {
     let reply = tokio::time::timeout(
-        Duration::from_secs(8),
+        timeout,
         control.call_with_seq(session::AttachAll::new("all")),
     )
     .await??;
     state.list_seq = reply.seq;
+    let mut removed = Vec::<(String, Vec<String>)>::new();
     shared.update(|m| {
+        let prev_sessions: HashSet<String> =
+            m.sessions.iter().map(|s| s.session_id.clone()).collect();
         m.sessions = reply.value.sessions;
-        m.views
-            .retain(|id, _| m.sessions.iter().any(|s| &s.session_id == id));
-        if m.selected
-            .as_ref()
-            .is_some_and(|id| !m.sessions.iter().any(|s| &s.session_id == id))
-        {
+        for session in &m.sessions {
+            if let Some(view) = m.views.get_mut(&session.session_id) {
+                view.label = Some(session.label.clone());
+            }
+        }
+        let current: HashSet<String> = m.sessions.iter().map(|s| s.session_id.clone()).collect();
+        let mut gone: HashSet<String> = m
+            .views
+            .keys()
+            .filter(|id| !current.contains(*id))
+            .cloned()
+            .collect();
+        for id in prev_sessions {
+            if !current.contains(&id) {
+                gone.insert(id);
+            }
+        }
+        for id in gone {
+            m.background_views.remove(&id);
+            let blocks: Vec<String> = m
+                .views
+                .remove(&id)
+                .map(|view| view_blocks(&view).collect())
+                .unwrap_or_default();
+            for block in &blocks {
+                m.forget_block(block);
+            }
+            removed.push((id, blocks));
+        }
+        if m.selected.as_ref().is_some_and(|id| !current.contains(id)) {
             m.selected = None;
         }
     });
+    for (id, blocks) in removed {
+        sweep.cancel_session(&id);
+        state.forget_session(&id, blocks);
+    }
     Ok(())
 }
 
@@ -1050,64 +1516,62 @@ fn reconcile(
     if model.visible
         && let (Some(session_id), Some(window)) = (&model.selected, model.window())
     {
-        for block in window.layers.iter().flat_map(|l| &l.blocks) {
-            let Some(id) = &block.block_id else {
-                continue;
-            };
-            if block.creator_name.as_deref() != Some("com.superlogical.terminal") {
-                continue;
-            }
-            if window
-                .zoomed_block_id
-                .as_ref()
-                .is_some_and(|zoom| zoom != id)
-            {
-                continue;
-            }
-            visible.insert(id.clone());
-            if workers.contains_key(id) {
-                continue;
-            }
-            let state = Arc::new(Mutex::new(Model {
-                status: "Restoring terminal…".into(),
-                session: session_id.clone(),
-                block: id.clone(),
-                owner: block.owner.as_deref() == Some(&model.client_id),
-                control_connected: model.connected,
-                ..Default::default()
-            }));
-            let (wake, receiver) = flume::bounded(1);
-            let connection = Connection {
-                model: state.clone(),
-                commands: TerminalSender::new(sender.clone(), session_id.clone(), id.clone()),
-                wake: receiver,
-            };
-            shared.update(|m| {
-                m.terminals.insert(id.clone(), connection);
-            });
-            let pane = PaneShared {
-                model: state,
-                wake,
-                host_wake: shared.wake.clone(),
-            };
-            let (commands, data_commands) = flume::unbounded();
-            let task = tokio::task::spawn_local(run_data(
-                endpoint.to_owned(),
-                session_id.clone(),
-                id.clone(),
-                sender.clone(),
-                data_commands,
-                pane,
-            ));
-            workers.insert(
-                id.clone(),
-                PaneWorker {
+        for layer in &window.layers {
+            for block in &layer.blocks {
+                let Some(id) = &block.block_id else {
+                    continue;
+                };
+                if block.creator_name.as_deref() != Some("com.superlogical.terminal") {
+                    continue;
+                }
+                if !crate::layout::block_visible(window, layer, id) {
+                    continue;
+                }
+                visible.insert(id.clone());
+                if workers.contains_key(id) {
+                    continue;
+                }
+                let state = Arc::new(Mutex::new(Model {
+                    status: "Restoring terminal…".into(),
                     session: session_id.clone(),
-                    commands,
-                    task,
-                    size: None,
-                },
-            );
+                    block: id.clone(),
+                    owner: block.owner.as_deref() == Some(&model.client_id),
+                    control_connected: model.connected,
+                    ..Default::default()
+                }));
+                let (wake, receiver) = flume::bounded(1);
+                let connection = Connection {
+                    model: state.clone(),
+                    commands: TerminalSender::new(sender.clone(), session_id.clone(), id.clone()),
+                    wake: receiver,
+                };
+                shared.update(|m| {
+                    m.terminals.insert(id.clone(), connection);
+                });
+                let pane = PaneShared {
+                    model: state,
+                    wake,
+                    host_wake: shared.wake.clone(),
+                };
+                let (commands, data_commands) = flume::unbounded();
+                let task = tokio::task::spawn_local(run_data(
+                    endpoint.to_owned(),
+                    session_id.clone(),
+                    id.clone(),
+                    sender.clone(),
+                    data_commands,
+                    pane,
+                ));
+                workers.insert(
+                    id.clone(),
+                    PaneWorker {
+                        session: session_id.clone(),
+                        commands,
+                        task,
+                        size: None,
+                    },
+                );
+            }
         }
     }
     for (id, worker) in workers {
@@ -1226,7 +1690,13 @@ async fn declare_themes(
     }
 }
 
-fn remove_session(shared: &Shared, workers: &mut HashMap<String, PaneWorker>, id: &str) {
+fn remove_session(
+    shared: &Shared,
+    workers: &mut HashMap<String, PaneWorker>,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    id: &str,
+) {
     let blocks: Vec<_> = workers
         .iter()
         .filter(|(_, w)| w.session == id)
@@ -1235,20 +1705,26 @@ fn remove_session(shared: &Shared, workers: &mut HashMap<String, PaneWorker>, id
     for block in &blocks {
         workers.remove(block);
     }
+    let mut forgotten = blocks.clone();
     shared.update(|m| {
         m.sessions.retain(|s| s.session_id != id);
+        m.background_views.remove(id);
         if let Some(view) = m.views.remove(id) {
             for block in view_blocks(&view) {
                 m.forget_block(&block);
+                forgotten.push(block);
             }
         }
-        for block in blocks {
-            m.terminals.remove(&block);
+        for block in &blocks {
+            m.terminals.remove(block);
+            m.forget_block(block);
         }
         if m.selected.as_deref() == Some(id) {
             m.selected = None;
         }
     });
+    sweep.cancel_session(id);
+    state.forget_session(id, forgotten);
 }
 
 fn apply_bootstrap(
@@ -1275,25 +1751,65 @@ fn apply_bootstrap(
         state
             .view_seq
             .insert(attached.session.session_id.clone(), reply.seq);
+        state.attached.insert(attached.session.session_id.clone());
         apply_view(shared, &attached.session.session_id, attached.view);
     }
     state.add_tickets(boot.data_tickets, started);
 }
 
+/// Take directed prompt events even if the server has not answered bootstrap yet.
+/// Other events still go through the normal post-bootstrap sequence cutoff.
+async fn bootstrap(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    boot: session::Bootstrap,
+    queued: &mut VecDeque<rexrs::Event>,
+) -> Result<rexrs::Reply<session::BootstrapResponse>> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let mut response = control
+            .transport()
+            .detach(session::Bootstrap::NAME, boot)
+            .await?;
+        loop {
+            tokio::select! {
+                biased;
+                reply = &mut response => return Ok(transport::detached_result_with_seq(&reply?)?),
+                event = control.next_event() => {
+                    let event = event?;
+                    if prompt::PromptState::is_event(&event) {
+                        state.prompt_event(control, shared, event).await?;
+                    } else {
+                        queued.push_back(event);
+                    }
+                }
+            }
+        }
+    })
+    .await?
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: rexrs::Event,
     control: &mut Client,
     shared: &Shared,
     workers: &mut HashMap<String, PaneWorker>,
     state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
     keymap: Option<&keymap::Declaration>,
+    server_reads: &mut server_info::Reader,
+    hosts_reads: &mut hosts::Reader,
 ) -> Result<()> {
-    // This is a directed request, not a session update: even an unattached session or a
-    // sequence below bootstrap's cutoff needs an answer on this same connection.
+    // Directed requests, not session updates: even an unattached session or a sequence below
+    // bootstrap's cutoff needs an answer on this same connection.
     if event.name == "client_perform_requested" {
         return perform::receive(control, shared, event.payload, state.performs_since).await;
     }
-    // Config-wide events have no session sequence. Do not broaden includes().
+    if prompt::PromptState::is_event(&event) {
+        return state.prompt_event(control, shared, event).await;
+    }
+    // Config-wide and server-wide events have no session sequence. Do not broaden includes().
     if event.name == "keymap_changed" {
         let refresh = {
             let m = shared.model.lock().expect("host model");
@@ -1304,19 +1820,172 @@ async fn handle_event(
         }
         return Ok(());
     }
+    if event.name == "hosts_changed" {
+        let reread = hosts::changed(
+            &shared.model.lock().expect("host model").shared,
+            hosts_reads.in_flight_hash(),
+            &event.payload,
+        );
+        if reread {
+            hosts_reads
+                .reread_for(control, event.payload["hash"].as_str())
+                .await?;
+        }
+        return Ok(());
+    }
+    if event.name == "tailscale_status_changed" {
+        server_reads.reread_status(control).await?;
+        return Ok(());
+    }
+    if event.name == "event_dropped" && event.payload["session_id"].as_str().is_none() {
+        match event.payload["event_type"].as_str() {
+            Some("keymap_changed") => {
+                let connected = shared.model.lock().expect("host model").connected;
+                if connected && let Some(declaration) = keymap {
+                    keymap::refresh(control, shared, declaration).await;
+                }
+                return Ok(());
+            }
+            Some("hosts_changed") => {
+                let supported = !matches!(
+                    shared.model.lock().expect("host model").shared,
+                    hosts::SharedHostState::Unsupported
+                );
+                if supported {
+                    hosts_reads.reread_for(control, None).await?;
+                }
+                return Ok(());
+            }
+            Some("tailscale_status_changed") => {
+                server_reads.reread_status(control).await?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if !state.includes(&event) {
         return Ok(());
     }
     match event.name.as_str() {
+        "event_dropped" => {
+            let event_type = event.payload["event_type"].as_str().unwrap_or("");
+            let block_event_name = event.payload["block_event_name"].as_str();
+            let dropped_block = event.payload["block_id"].as_str();
+            let session_id = event
+                .session_id
+                .as_deref()
+                .or_else(|| event.payload["session_id"].as_str());
+            if event_type == "block_event" && block_event_name == Some("ports_changed") {
+                ports::handle_dropped(control, shared, state, session_id, dropped_block, event.seq)
+                    .await?;
+                return Ok(());
+            }
+            if event_type.is_empty() || (event_type == "block_event" && block_event_name.is_none())
+            {
+                ports::handle_dropped(control, shared, state, session_id, dropped_block, event.seq)
+                    .await?;
+            }
+            match event_type {
+                "session_destroyed" => {
+                    if let Some(id) = session_id {
+                        remove_session(shared, workers, state, sweep, id);
+                    } else {
+                        list(control, shared, state, sweep).await?;
+                    }
+                }
+                "session_created" | "session_moved" | "session_label_changed" => {
+                    list(control, shared, state, sweep).await?;
+                }
+                _ if let Some(id) = session_id => {
+                    let dropped_block = event.payload["block_id"].as_str().map(str::to_owned);
+                    // Cancel any in-flight background status reads for this session before
+                    // awaiting `refresh` so late replies cannot race with recovery.
+                    sweep.cancel_session(id);
+                    let (should_refresh, mut forget) = {
+                        let m = shared.model.lock().expect("host model");
+                        let has_view = m.views.contains_key(id);
+                        let blocks: Vec<String> = m
+                            .views
+                            .get(id)
+                            .map(|v| view_blocks(v).collect())
+                            .unwrap_or_default();
+                        (has_view || m.selected.as_deref() == Some(id), blocks)
+                    };
+                    if let Some(block) = dropped_block {
+                        forget.push(block);
+                    }
+                    if should_refresh {
+                        match refresh_for_event(control, shared, state, sweep, id).await {
+                            Ok(()) => {
+                                let new_blocks: Vec<String> = shared
+                                    .model
+                                    .lock()
+                                    .expect("host model")
+                                    .views
+                                    .get(id)
+                                    .map(|v| view_blocks(v).collect())
+                                    .unwrap_or_default();
+                                forget.extend(new_blocks);
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.downcast_ref::<rexrs::Error>(),
+                                    Some(rexrs::Error::Api(
+                                        rexrs::ApiError::SessionNotFound { .. }
+                                    ))
+                                ) =>
+                            {
+                                remove_session(shared, workers, state, sweep, id);
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        state.viewed.remove(id);
+                        if state.view_reading.as_deref() == Some(id) {
+                            state.view_stale = true;
+                        }
+                        if state.fetch_reading.contains(id) {
+                            state.fetch_stale.insert(id.to_owned());
+                        }
+                    }
+                    shared.update(|m| {
+                        for block in &forget {
+                            m.status_read.remove(block);
+                            // Downgrade live records so a dropped StatusRemoved is not kept
+                            // stuck by status_sweep::merge's live-record preservation rule.
+                            if let Some(records) = m.activity.get_mut(block) {
+                                for record in records.values_mut() {
+                                    record.live = false;
+                                }
+                            }
+                        }
+                    });
+                    for block in &forget {
+                        state.queried.remove(block);
+                        state.status_queried.remove(block);
+                        state.status_failed.remove(block);
+                        state.status_reading.remove(block);
+                        sweep.cancel_block(block);
+                    }
+                }
+                _ if event_type.starts_with("session_") => {
+                    list(control, shared, state, sweep).await?;
+                }
+                _ => {
+                    log::debug!("ignoring unhandled server-wide event_dropped: {event_type:?}");
+                }
+            }
+        }
         "session_created" | "session_moved" => {
-            list(control, shared, state).await?;
+            list(control, shared, state, sweep).await?;
         }
         "session_destroyed" => {
             if let Some(id) = event.payload["session_id"]
                 .as_str()
                 .or(event.session_id.as_deref())
             {
-                remove_session(shared, workers, id);
+                remove_session(shared, workers, state, sweep, id);
             }
         }
         "session_label_changed" => {
@@ -1344,10 +2013,15 @@ async fn handle_event(
                         .as_u64()
                         .is_some_and(|new| new > revision)
                 }) {
-                    refresh(control, shared, state, id).await?;
-                } else if revision.is_none() && state.view_reading.as_deref() == Some(id) {
+                    refresh_for_event(control, shared, state, sweep, id).await?;
+                } else if revision.is_none() {
                     // The reply on its way may predate this change.
-                    state.view_stale = true;
+                    if state.view_reading.as_deref() == Some(id) {
+                        state.view_stale = true;
+                    }
+                    if state.fetch_reading.contains(id) {
+                        state.fetch_stale.insert(id.to_owned());
+                    }
                 }
             }
         }
@@ -1356,6 +2030,8 @@ async fn handle_event(
                 if let Some(worker) = workers.remove(block) {
                     let _ = worker.commands.send(DataCommand::Stop);
                 }
+                sweep.cancel_block(block);
+                state.forget_block(block);
                 shared.update(|m| {
                     m.terminals.remove(block);
                     m.forget_block(block);
@@ -1369,7 +2045,7 @@ async fn handle_event(
                     .views
                     .contains_key(id)
             {
-                refresh(control, shared, state, id).await?;
+                refresh_for_event(control, shared, state, sweep, id).await?;
             }
         }
         "block_event" => {
@@ -1395,6 +2071,24 @@ async fn handle_event(
                             }),
                         }
                     }
+                }
+                return Ok(());
+            }
+            if ports::is_ports_changed(&event.payload) {
+                if control.welcome().api_revision >= crate::ports::PORTS_EVENTS_MIN_API_REVISION
+                    && let (Some(session), Some(block)) = (
+                        event.session_id.as_deref(),
+                        event.payload["block_id"].as_str(),
+                    )
+                {
+                    ports::apply_event(
+                        shared,
+                        state,
+                        session,
+                        block,
+                        event.seq,
+                        &event.payload["payload"],
+                    );
                 }
                 return Ok(());
             }
@@ -1430,6 +2124,10 @@ async fn handle_event(
         }
         _ => {}
     }
+    ports::reconcile_selected(shared, state);
+    if state.ports_reads.can_pump() {
+        state.ports_reads.pump(control, shared).await?;
+    }
     Ok(())
 }
 
@@ -1440,6 +2138,13 @@ struct Startup {
     create: Option<(String, Option<String>)>,
     block: Option<String>,
     theme: Option<SetTheme>,
+    ssh_auth_sock: Option<PathBuf>,
+    prompts_enabled: bool,
+    max_api_revision: u32,
+    #[cfg(test)]
+    ssh_program: Option<PathBuf>,
+    #[cfg(test)]
+    tunnel_dir: Option<PathBuf>,
 }
 
 async fn run_host(
@@ -1455,14 +2160,24 @@ async fn run_host(
         block: mut initial_block,
         mut theme,
         label,
+        mut ssh_auth_sock,
+        mut prompts_enabled,
+        max_api_revision,
+        #[cfg(test)]
+        ssh_program,
+        #[cfg(test)]
+        tunnel_dir,
     } = startup;
     let mut token: Option<String> = None;
     let mut workers = HashMap::<String, PaneWorker>::new();
     let mut retry = 0;
+    let mut deferred_commands = VecDeque::new();
     let mut prefetch = prefetch::Prefetch::default();
     let mut keymap: Option<Box<keymap::Declaration>> = None;
     let mut server_reads = server_info::Reader::default();
+    let mut hosts_reads = hosts::Reader::default();
     let mut directory_reads = directory::Reader::default();
+    let mut view_fetches = view_fetch::Reader::default();
     // An ssh:// host is reached through a forward of its Rex socket; every attempt opens a
     // fresh one, and its end is a disconnect like any other.
     let ssh = crate::ssh::Target::parse(&configured)?;
@@ -1472,20 +2187,49 @@ async fn run_host(
             let endpoint = match &ssh {
                 Some(target) => {
                     shared.status("Connecting over SSH…", false);
-                    let opened = crate::ssh::Tunnel::open(target).await?;
+                    let opened = {
+                        #[cfg(test)]
+                        if ssh_program.is_some() || tunnel_dir.is_some() {
+                            crate::ssh::Tunnel::open_with(
+                                target,
+                                ssh_program
+                                    .as_deref()
+                                    .map_or(std::ffi::OsStr::new("ssh"), std::path::Path::as_os_str),
+                                ssh_auth_sock.as_deref(),
+                                tunnel_dir.as_deref(),
+                            )
+                            .await?
+                        } else {
+                            crate::ssh::Tunnel::open(target, ssh_auth_sock.as_deref()).await?
+                        }
+                        #[cfg(not(test))]
+                        {
+                            crate::ssh::Tunnel::open(target, ssh_auth_sock.as_deref()).await?
+                        }
+                    };
                     let local = opened.endpoint().to_owned();
                     tunnel = Some(opened);
                     local
                 }
                 None => configured.clone(),
             };
-            let mut control = transport::control_with_label(&endpoint, token.as_deref(), &label).await?;
+            let mut control = transport::control_with_max_revision(
+                &endpoint,
+                token.as_deref(),
+                &label,
+                max_api_revision,
+            )
+            .await?;
             let identity = control.welcome().client.as_ref().context("Rex client identity")?;
             token = Some(identity.reconnect_token.clone());
             let wanted = preferred.clone().or_else(|| shared.model.lock().expect("host model").selected.clone());
             shared.update(|m| {
                 m.connection_epoch += 1;
                 m.performs.clear();
+                m.prompt_events.clear();
+                m.actions_in_flight = 0;
+                m.view_fetches.clear();
+                m.focus_history_result = None;
                 m.client_id = identity.id.clone();
                 m.protocol.api_revision = control.welcome().api_revision;
                 m.server_info = server_info::ServerInfo::welcomed(control.welcome());
@@ -1506,29 +2250,30 @@ async fn run_host(
                 m.titles.clear();
                 m.places.clear();
                 m.progress.clear();
+                m.ports.clear();
+                m.ports_reading.clear();
+                m.ports_read_completions = 0;
                 m.activity_epoch += 1;
                 m.activity_reading = true;
                 m.activity_incomplete = false;
             });
-            let mut state = ControlState::default();
+            let mut state = ControlState { prompts_enabled, ..Default::default() };
+            let mut sweep = status_sweep::Reader::default();
             let mut downloads = downloads::Downloads::default();
             let mut busy_since = Some(Instant::now());
             let boot = bootstrap_request(wanted.as_deref(), create.is_some(), workers.values().map(|w| w.session.clone()));
             let started = Instant::now();
             shared.update(|m| m.protocol.bootstrap_requests += 1);
-            let result = tokio::time::timeout(Duration::from_secs(8), control.call_with_seq(boot)).await;
+            let mut deferred_events = VecDeque::new();
+            let result = bootstrap(&mut control, shared, &mut state, boot, &mut deferred_events).await;
             let reply = match result {
-                Ok(Ok(reply)) => reply,
-                error => {
+                Ok(reply) => reply,
+                Err(error) => {
                     // Setup may be partially applied. A graceful close ends the identity;
                     // never reuse its token or continue this partially initialized socket.
                     token = None;
                     let _ = tokio::time::timeout(Duration::from_secs(2), control.close()).await;
-                    return match error {
-                        Ok(Err(error)) => Err(error.into()),
-                        Err(error) => Err(error.into()),
-                        _ => unreachable!(),
-                    };
+                    return Err(error);
                 }
             };
             apply_bootstrap(shared, &mut state, reply, started);
@@ -1537,7 +2282,7 @@ async fn run_host(
                 let layout = crate::layout::shell_layout(shell.as_deref(), new_block_theme(shared, theme.as_ref()));
                 let created = request(&mut control, "session.create", json!({"label":label,"initial_windows":[{"layout":layout}]})).await?;
                 preferred = created["session_id"].as_str().map(str::to_owned);
-                list(&mut control, shared, &mut state).await?;
+                list(&mut control, shared, &mut state, &mut sweep).await?;
             }
             let selected = {
                 let model = shared.model.lock().expect("host model");
@@ -1553,21 +2298,36 @@ async fn run_host(
             });
             let session_ids: HashSet<_> = shared.model.lock().expect("host model").sessions.iter().map(|s| s.session_id.clone()).collect();
             let stale: HashSet<_> = workers.values().filter(|w| !session_ids.contains(&w.session)).map(|w| w.session.clone()).collect();
-            for id in stale { remove_session(shared, &mut workers, &id); }
+            for id in stale { remove_session(shared, &mut workers, &mut state, &mut sweep, &id); }
             let mut attached: HashSet<String> = workers.values().map(|w| w.session.clone()).collect();
             if let Some(id) = &selected { attached.insert(id.clone()); }
             for id in attached {
-                if !state.view_seq.contains_key(&id) { attach(&mut control, shared, &mut state, &id).await?; }
+                if !state.view_seq.contains_key(&id) { attach(&mut control, shared, &mut state, &mut sweep, &id).await?; }
             }
             if let (Some(id), Some(block)) = (&selected, initial_block.take()) {
                 request(&mut control, "session.focus_block", json!({"session_id":id,"block_id":block})).await?;
-                refresh(&mut control, shared, &mut state, id).await?;
+                refresh(&mut control, shared, &mut state, &mut sweep, id).await?;
             }
             state.performs_since = busy_since;
-            let queued: Vec<_> = control.drain_events().collect();
-            for event in queued { handle_event(event, &mut control, shared, &mut workers, &mut state, keymap.as_deref()).await?; }
+            server_reads.reset();
+            hosts_reads.reset();
+            deferred_events.extend(control.drain_events());
+            while let Some(event) = deferred_events.pop_front() {
+                handle_event(
+                    event,
+                    &mut control,
+                    shared,
+                    &mut workers,
+                    &mut state,
+                    &mut sweep,
+                    keymap.as_deref(),
+                    &mut server_reads,
+                    &mut hosts_reads,
+                )
+                .await?;
+            }
             state.prune(&shared.model.lock().expect("host model"));
-            shared.update(|m| m.ssh_server_missing = false);
+            shared.update(|m| m.ssh_problem = None);
             shared.status("Connected", true);
             reconcile(&endpoint, shared, &sender, &mut workers);
             for (block, worker) in &workers {
@@ -1578,26 +2338,43 @@ async fn run_host(
             query_activity(&mut control, shared, &mut state).await;
             // Restore terminal sizes and state before a best-effort keymap can wait.
             if let Some(declaration) = &keymap { keymap::refresh(&mut control, shared, declaration).await; }
-            server_reads.reset();
             server_reads.start(&mut control).await?;
+            hosts_reads.start(&mut control).await?;
             // The last connection's listing can no longer be answered.
             directory_reads.abandon(shared, directory::Failure::Disconnected);
             retry = 0;
             prefetch.reset();
-            let mut sweep = status_sweep::Reader::default();
+            view_fetches.reset();
             let mut pace = tokio::time::interval(prefetch::PACE);
             pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut expiry = tokio::time::interval(Duration::from_millis(100));
             loop {
+                let exclusive = state.actions.exclusive();
                 state.performs_since = state.performs_since.or(busy_since.take());
-                if state.performs_since.is_some() {
+                if !exclusive && (state.performs_since.is_some() || !deferred_events.is_empty()) {
                     // Buffered requests share the busy step's start, even when it took less
                     // than MAX_WAIT. They must not gain another five seconds in the UI queue.
                     use futures_util::FutureExt;
-                    if let Some(event) = control.next_event().now_or_never() {
+                    if let Some(event) = deferred_events.pop_front().map(Ok)
+                        .or_else(|| control.next_event().now_or_never())
+                    {
                         let event = event?;
-                        if event.name == "tailscale_status_changed" { server_reads.reread_status(&mut control).await?; }
-                        handle_event(event, &mut control, shared, &mut workers, &mut state, keymap.as_deref()).await?;
+                        if prompt::PromptState::is_event(&event) {
+                            state.prompt_event(&mut control, shared, event).await?;
+                            continue;
+                        }
+                        handle_event(
+                            event,
+                            &mut control,
+                            shared,
+                            &mut workers,
+                            &mut state,
+                            &mut sweep,
+                            keymap.as_deref(),
+                            &mut server_reads,
+                            &mut hosts_reads,
+                        )
+                        .await?;
                         state.prune(&shared.model.lock().expect("host model"));
                         reconcile(&endpoint, shared, &sender, &mut workers);
                         declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
@@ -1606,11 +2383,16 @@ async fn run_host(
                     }
                     state.performs_since = None;
                 }
-                let next = status_sweep::next(shared, &state);
+                if !exclusive && state.ports_reads.can_pump() {
+                    state.ports_reads.pump(&mut control, shared).await?;
+                }
+                let next = (!exclusive).then(|| status_sweep::next(shared, &state)).flatten();
                 let out = sweep.in_flight() + usize::from(prefetch.in_flight());
-                status_sweep::coverage(shared, &state, next.is_some() || out > 0);
+                if !exclusive {
+                    status_sweep::coverage(shared, &state, next.is_some() || out > 0);
+                }
                 // A few reads at once, at most one of them a layout; starts stay paced.
-                let room = out < status_sweep::IN_FLIGHT;
+                let room = !exclusive && out < status_sweep::IN_FLIGHT;
                 let due = match &next {
                     Some(status_sweep::Work::Status(..)) => room.then(Instant::now),
                     Some(status_sweep::Work::View(_)) => {
@@ -1623,8 +2405,23 @@ async fn run_host(
                 };
                 tokio::select! {
                     _ = expiry.tick() => {
+                        state.prompts.expire(shared);
+                        if exclusive { continue; }
                         busy_since = Some(Instant::now());
                         perform::expire(&mut control, shared).await?;
+                    }
+                    result = state.actions.finished(shared) => {
+                        if let Err(error) = result {
+                            shared.update(|m| m.notice = Some(format!("{error:#}")));
+                            if !matches!(error.downcast_ref::<rexrs::Error>(), Some(rexrs::Error::Api(_))) { return Err(error); }
+                        }
+                    }
+                    result = state.prompts.finished() => {
+                        if matches!(result, Err(rexrs::Error::Transport(_) | rexrs::Error::Closed { .. })) {
+                            result?;
+                        } else {
+                            state.prompts.record(shared, result);
+                        }
                     }
                     _ = prefetch::wait(&mut pace, due.unwrap_or_else(Instant::now)), if due.is_some() => {
                         busy_since = Some(Instant::now());
@@ -1649,7 +2446,7 @@ async fn run_host(
                             }
                         }
                     }
-                    (id, text) = prefetch.finished(), if prefetch.in_flight() => {
+                    (id, text) = prefetch.finished(), if !exclusive && prefetch.in_flight() => {
                         state.view_reading = None;
                         let stale = std::mem::take(&mut state.view_stale);
                         if let Some((seq, view)) = prefetch.result(&id, text, Instant::now()) {
@@ -1668,33 +2465,144 @@ async fn run_host(
                                 // Its layout changed while this read was out, and that
                                 // event had no layout to compare with: read it once more.
                                 if stale {
-                                    let _ = refresh(&mut control, shared, &mut state, &id).await;
+                                    let _ = refresh_for_event(&mut control, shared, &mut state, &mut sweep, &id).await;
                                 }
                             }
                         }
                     }
-                    (session, block, reply) = sweep.finished(), if sweep.in_flight() > 0 => {
+                    (session, block, reply) = sweep.finished(), if !exclusive && sweep.in_flight() > 0 => {
                         let removed = state.status_reading.remove(&block).unwrap_or_default();
                         status_sweep::record(shared, &mut state, &session, &block, reply, &removed);
                     }
-                    reply = server_reads.finished(), if server_reads.in_flight() => server_info::record(shared, reply),
-                    _ = directory_reads.finished(shared), if directory_reads.in_flight() => {}
+                    finished = state.ports_reads.finished(), if !exclusive && state.ports_reads.in_flight() > 0 => {
+                        ports::record_reply(shared, &mut state, finished);
+                        state.ports_reads.pump(&mut control, shared).await?;
+                    }
+                    reply = server_reads.finished(), if !exclusive && server_reads.in_flight() => server_info::record(shared, reply),
+                    reply = hosts_reads.finished(), if !exclusive && hosts_reads.in_flight() => hosts::record(shared, reply),
+                    _ = directory_reads.finished(shared), if !exclusive && directory_reads.in_flight() => {}
+                    fetched = view_fetches.finished(), if !exclusive && view_fetches.in_flight() => {
+                        match fetched {
+                            view_fetch::Event::Reply { session, ids, result: Ok((seq, view)) } => {
+                                if !view_fetches.reading(&session) {
+                                    state.fetch_reading.remove(&session);
+                                }
+                                let stale = state.fetch_stale.remove(&session);
+                                let mut placed = false;
+                                shared.update(|m| {
+                                    if !m.sessions.iter().any(|s| s.session_id == session) {
+                                        record_view_fetches(
+                                            m,
+                                            ids.iter().map(|&id| (id, ViewFetchOutcome::NotFound)),
+                                        );
+                                        return;
+                                    }
+                                    if !m.views.contains_key(&session) {
+                                        apply_view_to_model(m, &session, view);
+                                        if m.selected.as_deref() != Some(session.as_str()) {
+                                            m.background_views.insert(session.clone());
+                                        }
+                                        placed = true;
+                                    }
+                                    record_view_fetches(
+                                        m,
+                                        ids.iter().map(|&id| (id, ViewFetchOutcome::Loaded)),
+                                    );
+                                });
+                                if placed {
+                                    state.view_seq.insert(session.clone(), seq);
+                                    if stale {
+                                        let _ = refresh_for_event(&mut control, shared, &mut state, &mut sweep, &session).await;
+                                    }
+                                }
+                            }
+                            view_fetch::Event::Reply { session, ids, result: Err(outcome) } => {
+                                if !view_fetches.reading(&session) {
+                                    state.fetch_reading.remove(&session);
+                                    state.fetch_stale.remove(&session);
+                                }
+                                shared.update(|m| {
+                                    record_view_fetches(m, ids.into_iter().map(|id| (id, outcome)));
+                                });
+                            }
+                            view_fetch::Event::Expired { session, ids, finished } => {
+                                if finished && !view_fetches.reading(&session) {
+                                    state.fetch_reading.remove(&session);
+                                    state.fetch_stale.remove(&session);
+                                }
+                                shared.update(|m| {
+                                    record_view_fetches(
+                                        m,
+                                        ids.into_iter().map(|id| (id, ViewFetchOutcome::Failed)),
+                                    );
+                                });
+                            }
+                        }
+                    }
                     event = control.next_event() => {
-                        busy_since = Some(Instant::now());
                         let event = event?;
-                        if event.name == "tailscale_status_changed" { server_reads.reread_status(&mut control).await?; }
-                        handle_event(event, &mut control, shared, &mut workers, &mut state, keymap.as_deref()).await?;
+                        if prompt::PromptState::is_event(&event) {
+                            state.prompt_event(&mut control, shared, event).await?;
+                            continue;
+                        }
+                        if exclusive {
+                            deferred_events.push_back(event);
+                            continue;
+                        }
+                        busy_since = Some(Instant::now());
+                        handle_event(
+                            event,
+                            &mut control,
+                            shared,
+                            &mut workers,
+                            &mut state,
+                            &mut sweep,
+                            keymap.as_deref(),
+                            &mut server_reads,
+                            &mut hosts_reads,
+                        )
+                        .await?;
                         state.prune(&shared.model.lock().expect("host model"));
                         reconcile(&endpoint, shared, &sender, &mut workers);
                         declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
                         query_activity(&mut control, shared, &mut state).await;
                     }
                     error = crate::ssh::closed(&mut tunnel) => return Err(error),
-                    command = commands.recv_async() => {
-                        busy_since = Some(Instant::now());
+                    command = async {
+                        if !exclusive && let Some(command) = deferred_commands.pop_front() {
+                            Ok(command)
+                        } else {
+                            commands.recv_async().await
+                        }
+                    } => {
                         let Ok(command) = command else { control.close().await?; return Ok(true); };
                         if matches!(command, HostCommand::Shutdown) { control.close().await?; return Ok(true); }
                         if matches!(command, HostCommand::Reconnect) { return Ok(false); }
+                        if let HostCommand::Prompts(enabled) = command {
+                            prompts_enabled = enabled;
+                            state.prompts_enabled = enabled;
+                            if !enabled { state.prompts.disable(&mut control, shared).await?; }
+                            continue;
+                        }
+                        if let HostCommand::PromptReply { epoch, call_id, answer } = command {
+                            state.prompts.answer(&mut control, shared, epoch, call_id, answer).await?;
+                            continue;
+                        }
+                        if exclusive {
+                            deferred_commands.push_back(command);
+                            continue;
+                        }
+                        busy_since = Some(Instant::now());
+                        if let HostCommand::Action { generation, request } = command {
+                            state.prompts.expire(shared);
+                            let prompt_deadline = state.prompts.deadline();
+                            state.actions.start(&mut control, shared, generation, *request, prompt_deadline).await?;
+                            continue;
+                        }
+                        if let HostCommand::SshAgent { socket, .. } = command {
+                            ssh_auth_sock = socket;
+                            continue;
+                        }
                         if let HostCommand::StopServer { epoch } = command {
                             if epoch != shared.model.lock().expect("host model").connection_epoch {
                                 shared.update(|m| m.notice = Some("Stop not sent: the connection changed. Review Stop server again.".into()));
@@ -1724,15 +2632,139 @@ async fn run_host(
                             }
                             continue;
                         }
+                        if let HostCommand::ResizeLayer {
+                            epoch,
+                            session,
+                            layer,
+                            bounds,
+                            raise_first,
+                        } = command
+                        {
+                            let live_epoch = shared.model.lock().expect("host model").connection_epoch;
+                            if epoch != live_epoch {
+                                shared.update(|m| {
+                                    m.notice = Some(crate::layers::Blocked::ChangedDuringDrag.sentence());
+                                });
+                                continue;
+                            }
+                            let rev = control.welcome().api_revision;
+                            if rev < crate::layers::MIN_API_REVISION {
+                                shared.update(|m| {
+                                    m.notice = Some(crate::layers::Blocked::OldServer(rev).sentence());
+                                });
+                                continue;
+                            }
+                            let Some(bounds) = crate::layers::sendable(bounds) else {
+                                continue;
+                            };
+                            let outcome: Result<()> = async {
+                                if raise_first {
+                                    request(
+                                        &mut control,
+                                        "session.raise_layer",
+                                        json!({"session_id": session, "layer_id": layer}),
+                                    )
+                                    .await?;
+                                }
+                                request(
+                                    &mut control,
+                                    "session.resize_layer",
+                                    json!({"session_id": session, "layer_id": layer, "bounds": bounds}),
+                                )
+                                .await?;
+                                after_request(
+                                    &mut control,
+                                    shared,
+                                    &mut workers,
+                                    &mut state,
+                                    &mut sweep,
+                                    Some(&session),
+                                )
+                                .await
+                            }
+                            .await;
+                            if let Err(error) = outcome {
+                                shared.update(|m| m.notice = Some(format!("{error:#}")));
+                                if !matches!(error.downcast_ref::<rexrs::Error>(), Some(rexrs::Error::Api(_))) {
+                                    return Err(error);
+                                }
+                            }
+                            state.prune(&shared.model.lock().expect("host model"));
+                            reconcile(&endpoint, shared, &sender, &mut workers);
+                            declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
+                            query_activity(&mut control, shared, &mut state).await;
+                            continue;
+                        }
                         if let HostCommand::Keymap(new) = command {
                             keymap::refresh(&mut control, shared, &new).await;
                             keymap = Some(new);
                             continue;
                         }
                         if let HostCommand::PrefetchViews(sessions) = command { prefetch.set_eligible(sessions); continue; }
+                        if let HostCommand::FetchView { id, epoch, deadline, session } = command {
+                            let (live_epoch, already_loaded, listed) = {
+                                let m = shared.model.lock().expect("host model");
+                                (
+                                    m.connection_epoch,
+                                    m.views.contains_key(&session),
+                                    m.sessions.iter().any(|s| s.session_id == session),
+                                )
+                            };
+                            if epoch != live_epoch {
+                                continue;
+                            }
+                            if already_loaded {
+                                shared.update(|m| record_view_fetches(m, [(id, ViewFetchOutcome::Loaded)]));
+                                continue;
+                            }
+                            if !listed {
+                                shared.update(|m| record_view_fetches(m, [(id, ViewFetchOutcome::NotFound)]));
+                                continue;
+                            }
+                            if Instant::now() >= deadline {
+                                shared.update(|m| record_view_fetches(m, [(id, ViewFetchOutcome::Failed)]));
+                                continue;
+                            }
+                            if view_fetches.start(&mut control, id, deadline, session.clone()).await? {
+                                state.fetch_reading.insert(session);
+                            } else {
+                                shared.update(|m| record_view_fetches(m, [(id, ViewFetchOutcome::Failed)]));
+                            }
+                            continue;
+                        }
                         if let HostCommand::Identify = command {
                             server_reads.want();
                             server_reads.start(&mut control).await?;
+                            continue;
+                        }
+                        if let HostCommand::WatchSharedHosts = command {
+                            let retryable = shared
+                                .model
+                                .lock()
+                                .expect("host model")
+                                .shared
+                                .retryable();
+                            hosts_reads.watch(&mut control, retryable).await?;
+                            continue;
+                        }
+                        if let HostCommand::WatchPorts { epoch, session } = command {
+                            if epoch == shared.model.lock().expect("host model").connection_epoch {
+                                ports::watch(&mut control, shared, &mut state, session).await?;
+                            }
+                            continue;
+                        }
+                        if let HostCommand::ReadPorts { epoch, session } = command {
+                            if epoch == shared.model.lock().expect("host model").connection_epoch {
+                                ports::read_once(&mut control, shared, &mut state, &session).await?;
+                            }
+                            continue;
+                        }
+                        if let HostCommand::PutSharedHost { id, epoch, host } = command {
+                            hosts::execute_put(&mut control, shared, &mut hosts_reads, id, epoch, host).await?;
+                            continue;
+                        }
+                        if let HostCommand::RemoveSharedHost { id, epoch, host_id } = command {
+                            hosts::execute_remove(&mut control, shared, &mut hosts_reads, id, epoch, host_id).await?;
                             continue;
                         }
                         if let HostCommand::Upload { session, block, files } = command {
@@ -1761,9 +2793,24 @@ async fn run_host(
                             });
                             continue;
                         }
-                        if matches!(command, HostCommand::Select(_) | HostCommand::Navigate { .. } | HostCommand::CreateSession { .. }) { preferred = None; }
+                        if let HostCommand::ReverseFocusHistory { epoch, id, deadline, .. } = &command
+                            && Instant::now() >= *deadline
+                        {
+                            focus_history::expire(shared, *epoch, *id);
+                            continue;
+                        }
+                        if matches!(
+                            command,
+                            HostCommand::Select(_)
+                                | HostCommand::Navigate { .. }
+                                | HostCommand::CreateSession { .. }
+                                | HostCommand::ReverseFocusHistory { .. }
+                        ) {
+                            preferred = None;
+                        }
                         let navigation = match &command { HostCommand::Navigate { id, .. } => Some(*id), _ => None };
-                        let outcome = handle_command(command, &mut control, shared, &mut workers, &mut state, &mut theme).await;
+                        let outcome = handle_command(command, &mut control, shared, &mut workers, &mut state, &mut sweep, &mut theme).await;
+                        ports::reconcile_selected(shared, &mut state);
                         if let Some(id) = navigation {
                             shared.update(|m| m.navigation_result = Some((id, outcome.is_ok())));
                         }
@@ -1781,14 +2828,20 @@ async fn run_host(
         }.await;
         tunnel = None;
         if matches!(result, Ok(true)) {
+            deferred_commands.clear();
+            shared.update(|m| {
+                m.prompt_events.clear();
+                m.actions_in_flight = 0;
+            });
             return Ok(());
         }
         shared.update(|m| {
             m.performs.clear();
-            m.ssh_server_missing = result
+            m.view_fetches.clear();
+            m.ssh_problem = result
                 .as_ref()
                 .err()
-                .is_some_and(|e| e.downcast_ref::<crate::ssh::MissingServer>().is_some())
+                .and_then(crate::ssh::Problem::from_error);
         });
         shared.status(
             match result {
@@ -1797,55 +2850,99 @@ async fn run_host(
             },
             false,
         );
-        retry += 1;
-        let delay = tokio::time::sleep(Duration::from_secs((1_u64 << retry.min(3)).min(8)));
-        tokio::pin!(delay);
+        let mut retry_now = false;
+        let mut delay = None;
         loop {
-            tokio::select! {
-                _ = &mut delay => break,
-                command = commands.recv_async() => match command {
-                    Ok(HostCommand::Shutdown) | Err(_) => return Ok(()),
-                    Ok(HostCommand::Reconnect) => break,
-                    Ok(HostCommand::Select(id)) => preferred = Some(id),
-                    Ok(HostCommand::Navigate { id, .. }) => reject_navigation(shared, id),
-                    Ok(HostCommand::Visibility(visible)) => shared.update(|m|m.visible=visible),
-                    Ok(HostCommand::PrefetchViews(sessions)) => prefetch.set_eligible(sessions),
-                    Ok(HostCommand::Theme(new)) => theme = new,
-                    Ok(HostCommand::Keymap(new)) => keymap = Some(new),
-                    Ok(HostCommand::Identify) => server_reads.want(),
-                    Ok(HostCommand::Ticket { reply, .. }) => { let _ = reply.send(Err("Host is reconnecting".into())); }
-                    Ok(HostCommand::Claim { .. } | HostCommand::PerformReply { .. }) => {}
-                    Ok(HostCommand::ListDir(request)) => directory::finish(shared, &request, Err(directory::Failure::Disconnected)),
-                    Ok(HostCommand::Download(request)) => downloads::refuse(shared, *request, crate::download::Failure::Disconnected),
-                    Ok(HostCommand::DownloadConfirm(_) | HostCommand::DownloadCancel(_)) => {}
-                    Ok(HostCommand::Terminal { block, command: Command::Selection(input), .. }) => {
-                        if let Some(worker) = workers.get(&block) { let _ = worker.commands.send(DataCommand::Selection(input)); }
+            // Settle the older, deferred work before reading newer commands or starting
+            // the retry timer. Drain the channel again at the end so nothing is replayed.
+            let (command, in_backoff) = if let Some(command) = deferred_commands.pop_front() {
+                (command, false)
+            } else if retry_now {
+                let Ok(command) = commands.try_recv() else {
+                    break;
+                };
+                (command, false)
+            } else {
+                let delay = delay.get_or_insert_with(|| {
+                    retry += 1;
+                    Box::pin(tokio::time::sleep(Duration::from_secs(
+                        (1_u64 << retry.min(3)).min(8),
+                    )))
+                });
+                tokio::select! {
+                    _ = delay => {
+                        retry_now = true;
+                        continue;
                     }
-                    Ok(HostCommand::Terminal { block, command: Command::Resize(a,b,c,d), .. }) => {
-                        if let Some(worker) = workers.get_mut(&block) { worker.size = Some((a,b,c,d)); }
+                    command = commands.recv_async() => {
+                        let Ok(command) = command else { return Ok(()); };
+                        (command, true)
                     }
-                    Ok(HostCommand::Terminal { block, command, .. }) if forward_search(&workers, &block, &command) => {}
-                    Ok(_) => shared.update(|m| m.notice = Some("Action not sent while disconnected. Try it again after reconnecting.".into())),
                 }
-            }
-        }
-        // Discard input already queued before a failure; never replay it after reconnect.
-        while let Ok(command) = commands.try_recv() {
+            };
             match command {
                 HostCommand::Shutdown => return Ok(()),
+                HostCommand::Reconnect => retry_now = true,
                 HostCommand::Select(id) => preferred = Some(id),
                 HostCommand::Navigate { id, .. } => reject_navigation(shared, id),
                 HostCommand::Visibility(visible) => shared.update(|m| m.visible = visible),
                 HostCommand::PrefetchViews(sessions) => prefetch.set_eligible(sessions),
                 HostCommand::Theme(new) => theme = new,
+                HostCommand::SshAgent { socket, wake_auth_retry } => {
+                    ssh_auth_sock = socket;
+                    if in_backoff
+                        && wake_auth_retry
+                        && ssh.is_some()
+                        && shared.model.lock().expect("host model").ssh_problem
+                            == Some(crate::ssh::Problem::AuthFailed)
+                    {
+                        retry = 0;
+                        retry_now = true;
+                    }
+                }
                 HostCommand::Keymap(new) => keymap = Some(new),
+                HostCommand::Prompts(enabled) => prompts_enabled = enabled,
                 HostCommand::Identify => server_reads.want(),
+                HostCommand::WatchSharedHosts => hosts_reads.want(),
+                HostCommand::PutSharedHost { id, epoch, .. } => hosts::reject_write(
+                    shared,
+                    id,
+                    epoch,
+                    hosts::WriteKind::Put,
+                    "disconnected",
+                    if in_backoff {
+                        "Shared host change not sent while disconnected. Try again after reconnecting."
+                    } else {
+                        "Shared host change not sent: the connection dropped first. Try again after reconnecting."
+                    },
+                ),
+                HostCommand::RemoveSharedHost { id, epoch, .. } => hosts::reject_write(
+                    shared,
+                    id,
+                    epoch,
+                    hosts::WriteKind::Remove,
+                    "disconnected",
+                    if in_backoff {
+                        "Shared host removal not sent while disconnected. Try again after reconnecting."
+                    } else {
+                        "Shared host removal not sent: the connection dropped first. Try again after reconnecting."
+                    },
+                ),
                 HostCommand::Ticket { reply, .. } => {
                     let _ = reply.send(Err("Host is reconnecting".into()));
                 }
-                HostCommand::Terminal { block, command, .. } => {
-                    forward_search(&workers, &block, &command);
+                HostCommand::Terminal { block, command: Command::Selection(input), .. } if in_backoff => {
+                    if let Some(worker) = workers.get(&block) {
+                        let _ = worker.commands.send(DataCommand::Selection(input));
+                    }
                 }
+                HostCommand::Terminal { block, command: Command::Resize(a,b,c,d), .. } if in_backoff => {
+                    if let Some(worker) = workers.get_mut(&block) {
+                        worker.size = Some((a,b,c,d));
+                    }
+                }
+                HostCommand::Terminal { block, command, .. }
+                    if forward_search(&workers, &block, &command) => {}
                 HostCommand::ListDir(request) => {
                     directory::finish(shared, &request, Err(directory::Failure::Disconnected))
                 }
@@ -1854,12 +2951,38 @@ async fn run_host(
                 }
                 // Confirmed, but the connection failed before it was read: say so, since
                 // the dialog has already closed.
-                HostCommand::StopServer { .. } => shared.update(|m| {
+                HostCommand::StopServer { .. } if !in_backoff => shared.update(|m| {
                     m.notice = Some(
                         "Stop not sent: the connection dropped first. Check the host before trying again. Nothing was retried."
                             .into(),
                     );
                     m.server_stop_result = m.notice.clone();
+                }),
+                HostCommand::ResizeLayer { .. } => shared.update(|m| {
+                    m.notice = Some(crate::layers::Blocked::NotConnected.sentence());
+                }),
+                HostCommand::UndoClose { .. } => shared.update(|m| {
+                    m.notice = Some(UNDO_CLOSE_DISCONNECTED.into());
+                }),
+                HostCommand::ReverseFocusHistory { epoch, .. } => {
+                    if in_backoff
+                        && epoch == shared.model.lock().expect("host model").connection_epoch
+                    {
+                        shared.update(|m| {
+                            m.notice = Some(FOCUS_HISTORY_DISCONNECTED_NOTICE.into());
+                        });
+                    }
+                }
+                HostCommand::Claim { .. }
+                | HostCommand::PerformReply { .. }
+                | HostCommand::PromptReply { .. }
+                | HostCommand::FetchView { .. }
+                | HostCommand::WatchPorts { .. }
+                | HostCommand::ReadPorts { .. }
+                | HostCommand::DownloadConfirm(_)
+                | HostCommand::DownloadCancel(_) => {}
+                _ if in_backoff => shared.update(|m| {
+                    m.notice = Some("Action not sent while disconnected. Try it again after reconnecting.".into());
                 }),
                 _ => {}
             }
@@ -1885,6 +3008,7 @@ fn forward_search(workers: &HashMap<String, PaneWorker>, block: &str, command: &
         Command::SearchStep(older) => DataCommand::SearchStep(*older),
         Command::PromptStep(older) => DataCommand::PromptStep(*older),
         Command::CursorStyle(shape) => DataCommand::CursorStyle(*shape),
+        Command::CopyMode(input) => DataCommand::CopyMode(*input),
         _ => return false,
     };
     if let Some(worker) = workers.get(block) {
@@ -1966,21 +3090,89 @@ async fn after_request(
     shared: &Shared,
     workers: &mut HashMap<String, PaneWorker>,
     state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
     session: Option<&str>,
 ) -> Result<()> {
     shared.update(|m| m.notice = None);
     if let Some(id) = session {
         // Destroying a session, or closing its last tab, ends it: nothing to re-read.
-        match refresh(control, shared, state, id).await {
+        match refresh_for_event(control, shared, state, sweep, id).await {
             Err(error)
                 if matches!(
                     error.downcast_ref::<rexrs::Error>(),
                     Some(rexrs::Error::Api(rexrs::ApiError::SessionNotFound { .. }))
                 ) =>
             {
-                remove_session(shared, workers, id)
+                remove_session(shared, workers, state, sweep, id)
             }
             result => result?,
+        }
+    }
+    Ok(())
+}
+
+async fn undo_close(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    epoch: u64,
+) -> Result<()> {
+    if shared.model.lock().expect("host model").connection_epoch != epoch {
+        return Ok(());
+    }
+    if control.welcome().api_revision < UNDO_CLOSE_MIN_API_REVISION {
+        shared.update(|m| m.notice = Some(UNDO_CLOSE_REQUIRES_API.into()));
+        return Ok(());
+    }
+    let reopened = async {
+        let reply = request(control, "client.undo_close", json!({})).await;
+        let reply = match reply {
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<rexrs::Error>(),
+                    Some(rexrs::Error::Api(rexrs::ApiError::NotFound { .. }))
+                ) =>
+            {
+                shared.update(|m| m.notice = Some("Nothing to reopen".into()));
+                return Ok(());
+            }
+            result => result?,
+        };
+        let id = reply["session_id"]
+            .as_str()
+            .context("missing reopened session ID")?;
+        let listed = shared
+            .model
+            .lock()
+            .expect("host model")
+            .sessions
+            .iter()
+            .any(|s| s.session_id == id);
+        if !listed {
+            list(control, shared, state, sweep).await?;
+        }
+        let selected = shared.model.lock().expect("host model").selected.as_deref() == Some(id);
+        if selected {
+            refresh(control, shared, state, sweep, id).await?;
+        } else {
+            attach(control, shared, state, sweep, id).await?;
+        }
+        shared.update(|m| {
+            m.background_views.remove(id);
+            m.selected = Some(id.into());
+            m.notice = None;
+        });
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = reopened {
+        shared.update(|m| m.notice = Some(format!("Could not finish Undo close: {error:#}")));
+        if matches!(
+            error.downcast_ref::<rexrs::Error>(),
+            Some(rexrs::Error::Transport(_) | rexrs::Error::Closed { .. })
+        ) {
+            return Err(error);
         }
     }
     Ok(())
@@ -1992,13 +3184,10 @@ async fn handle_command(
     shared: &Shared,
     workers: &mut HashMap<String, PaneWorker>,
     state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
     theme: &mut Option<SetTheme>,
 ) -> Result<()> {
     match command {
-        HostCommand::Action {
-            generation,
-            request,
-        } => actions::run(control, shared, generation, *request).await?,
         HostCommand::PerformReply {
             epoch,
             call_id,
@@ -2036,8 +3225,18 @@ async fn handle_command(
             session, window, ..
         } => {
             let selected = shared.model.lock().expect("host model").selected.clone();
+            let api19 = control.welcome().api_revision >= FOCUS_HISTORY_MIN_API_REVISION;
             if selected.as_ref() != Some(&session) {
-                attach(control, shared, state, &session).await?;
+                if api19 && state.attached.contains(&session) {
+                    if window.is_none() {
+                        refresh(control, shared, state, sweep, &session).await?;
+                    }
+                } else {
+                    attach(control, shared, state, sweep, &session).await?;
+                    if api19 && window.is_none() {
+                        refresh(control, shared, state, sweep, &session).await?;
+                    }
+                }
             }
             if let Some(window) = window {
                 request(
@@ -2046,7 +3245,7 @@ async fn handle_command(
                     json!({"session_id":session,"window_id":window}),
                 )
                 .await?;
-                refresh(control, shared, state, &session).await?;
+                refresh(control, shared, state, sweep, &session).await?;
             }
             shared.update(|m| {
                 m.background_views.remove(&session);
@@ -2055,7 +3254,15 @@ async fn handle_command(
             });
         }
         HostCommand::Select(id) => {
-            attach(control, shared, state, &id).await?;
+            let api19 = control.welcome().api_revision >= FOCUS_HISTORY_MIN_API_REVISION;
+            if api19 && state.attached.contains(&id) {
+                refresh(control, shared, state, sweep, &id).await?;
+            } else {
+                attach(control, shared, state, sweep, &id).await?;
+                if api19 {
+                    refresh(control, shared, state, sweep, &id).await?;
+                }
+            }
             shared.update(|m| {
                 m.background_views.remove(&id);
                 m.selected = Some(id);
@@ -2063,10 +3270,10 @@ async fn handle_command(
             });
         }
         HostCommand::RefreshSessions => {
-            list(control, shared, state).await?;
+            list(control, shared, state, sweep).await?;
             // A selected session that has gone is forgotten by the list, not re-read.
             let selected = shared.model.lock().expect("host model").selected.clone();
-            after_request(control, shared, workers, state, selected.as_deref()).await?;
+            after_request(control, shared, workers, state, sweep, selected.as_deref()).await?;
         }
         HostCommand::CreateSession { label, shell } => {
             let layout = crate::layout::shell_layout(
@@ -2080,18 +3287,53 @@ async fn handle_command(
             }
             let created = request(control, "session.create", payload).await?;
             let id = created["session_id"].as_str().context("new session ID")?;
-            list(control, shared, state).await?;
-            attach(control, shared, state, id).await?;
+            list(control, shared, state, sweep).await?;
+            attach(control, shared, state, sweep, id).await?;
             shared.update(|m| {
                 m.background_views.remove(id);
                 m.selected = Some(id.into());
                 m.notice = None;
             });
         }
-        HostCommand::Request { method, payload } => {
+        HostCommand::UndoClose { epoch } => {
+            undo_close(control, shared, state, sweep, epoch).await?
+        }
+        HostCommand::ReverseFocusHistory {
+            epoch,
+            id,
+            scope,
+            cursor,
+            deadline,
+        } => {
+            focus_history::reverse(
+                control, shared, state, sweep, epoch, id, scope, cursor, deadline,
+            )
+            .await?
+        }
+        HostCommand::Close { .. } | HostCommand::Request { .. } => {
+            let (method, payload) = match command {
+                HostCommand::Close { kind, mut payload } => {
+                    if control.welcome().api_revision >= UNDO_CLOSE_MIN_API_REVISION {
+                        payload["undoable"] = json!(true);
+                    }
+                    (std::borrow::Cow::Borrowed(kind.method()), payload)
+                }
+                HostCommand::Request { method, payload } => {
+                    (std::borrow::Cow::Owned(method), payload)
+                }
+                _ => unreachable!(),
+            };
             let session_id = payload["session_id"].as_str().map(str::to_owned);
             request(control, &method, payload).await?;
-            after_request(control, shared, workers, state, session_id.as_deref()).await?;
+            let after_session = if method == "session.detach" {
+                if let Some(detached) = session_id.as_deref() {
+                    state.attached.remove(detached);
+                }
+                None
+            } else {
+                session_id.as_deref()
+            };
+            after_request(control, shared, workers, state, sweep, after_session).await?;
         }
         HostCommand::NewTerminal {
             method,
@@ -2107,7 +3349,7 @@ async fn handle_command(
             }
             // Creation is sent once. A failure follows the ordinary request path; never replay.
             request(control, &method, payload).await?;
-            after_request(control, shared, workers, state, Some(&session)).await?;
+            after_request(control, shared, workers, state, sweep, Some(&session)).await?;
         }
         HostCommand::Ticket {
             session,
@@ -2145,6 +3387,9 @@ async fn handle_command(
             match command {
                 Command::Selection(input) => {
                     let _ = worker.commands.send(DataCommand::Selection(input));
+                }
+                Command::CopyMode(input) => {
+                    let _ = worker.commands.send(DataCommand::CopyMode(input));
                 }
                 Command::Resize(cols, rows, w, h) => {
                     worker.size = Some((cols, rows, w, h));
@@ -2284,12 +3529,23 @@ async fn handle_command(
             }
         }
         HostCommand::ListDir(_)
+        | HostCommand::Action { .. }
+        | HostCommand::Prompts(_)
+        | HostCommand::PromptReply { .. }
         | HostCommand::Reconnect
+        | HostCommand::SshAgent { .. }
         | HostCommand::Shutdown
         | HostCommand::StopServer { .. }
+        | HostCommand::ResizeLayer { .. }
         | HostCommand::PrefetchViews(_)
+        | HostCommand::FetchView { .. }
         | HostCommand::Keymap(_)
         | HostCommand::Identify
+        | HostCommand::WatchSharedHosts
+        | HostCommand::WatchPorts { .. }
+        | HostCommand::ReadPorts { .. }
+        | HostCommand::PutSharedHost { .. }
+        | HostCommand::RemoveSharedHost { .. }
         | HostCommand::Download(_)
         | HostCommand::DownloadConfirm(_)
         | HostCommand::DownloadCancel(_)
@@ -2321,6 +3577,20 @@ async fn resize(
     Ok(())
 }
 
+fn fail_copy_mode(
+    copy_mode: &mut crate::terminal::copy_mode::Controller,
+    shared: &PaneShared,
+    error: anyhow::Error,
+) {
+    let ended = copy_mode.reset();
+    shared.update(|m| {
+        m.notice = Some(format!("Copy mode failed: {error:#}"));
+        if let Some(epoch) = ended {
+            m.copy_ended_epoch = m.copy_ended_epoch.max(epoch);
+        }
+    });
+}
+
 async fn run_data(
     endpoint: String,
     session: String,
@@ -2332,6 +3602,9 @@ async fn run_data(
     let mut welcome: Option<wire::Welcome> = None;
     let mut stream: Option<TerminalStream> = None;
     let mut selection = None;
+    let mut copy_mode = crate::terminal::copy_mode::Controller::default();
+    let mut pending_yank: Option<crate::terminal::copy_mode::CopyYank> = None;
+    let mut selection_revision: u64 = 0;
     let mut search = crate::terminal::search::Controller::default();
     let mut prompt_anchor = false;
     let mut visible = true;
@@ -2357,18 +3630,28 @@ async fn run_data(
             if socket.is_none() {
                 let (next, fresh) = open_data(&endpoint, &session, &block, &host).await?;
                 selection = Some(crate::terminal::selection::Controller::new()?);
+                let ended = copy_mode.reset();
+                pending_yank = None;
+                selection_revision = 0;
                 search.forget_terminal();
                 prompt_anchor = false;
                 let mut restored = TerminalStream::new(fresh.nonce);
                 restored.set_cursor_style(cursor_style)?;
                 stream = Some(restored); welcome = Some(fresh);
-                shared.update(|m|m.restore_generation+=1);
+                shared.update(|m| {
+                    m.restore_generation += 1;
+                    m.copy_yank = None;
+                    if let Some(epoch) = ended {
+                        m.copy_ended_epoch = m.copy_ended_epoch.max(epoch);
+                    }
+                });
                 renderer = Renderer::new()?; socket = Some(next);
                 shared.status("Restoring terminal…", false);
             }
             let mut socket = socket.context("data socket")?;
             let stream = stream.as_mut().context("terminal stream")?;
             let selection = selection.as_mut().context("selection controller")?;
+            let mut pending_copy_search: Option<PendingCopySearch> = None;
             let mut dirty = true;
             let mut tick = tokio::time::interval(Duration::from_millis(16));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2379,24 +3662,125 @@ async fn run_data(
                         dirty = true;
                     }
                     command = commands.recv_async() => match command {
-                        Ok(DataCommand::Selection(input)) => if input.generation == shared.model.lock().expect("terminal model").restore_generation && let Some(terminal) = &stream.terminal { selection.apply(terminal, input)?; dirty = true; },
+                        Ok(DataCommand::Selection(input)) => if input.generation == shared.model.lock().expect("terminal model").restore_generation && let Some(terminal) = &stream.terminal {
+                            let replaces = matches!(
+                                input.phase,
+                                crate::terminal::selection::Phase::Down(_)
+                                    | crate::terminal::selection::Phase::Clear
+                                    | crate::terminal::selection::Phase::All
+                            ) || (matches!(input.phase, crate::terminal::selection::Phase::Move)
+                                && selection.is_dragging());
+                            selection.apply(terminal, input)?;
+                            selection_revision = selection.revision;
+                            if replaces {
+                                copy_mode.clear_owned_selection();
+                            }
+                            dirty = true;
+                        },
+                        Ok(DataCommand::CopyMode(input)) => if input.generation == shared.model.lock().expect("terminal model").restore_generation && let Some(terminal) = &mut stream.terminal {
+                            let is_to_match = matches!(input.op, crate::terminal::copy_mode::CopyModeOp::ToMatch);
+                            match copy_mode.apply(terminal, Some(&search), input) {
+                                Ok(outcome) if outcome.accepted => {
+                                    prompt_anchor = false;
+                                    selection_revision = input.revision;
+                                    if let Err(error) = selection.stop(terminal) {
+                                        shared.update(|m| m.notice = Some(format!("Copy mode failed: {error:#}")));
+                                    }
+                                    if let Some(yank) = outcome.yank {
+                                        pending_yank = Some(yank);
+                                    }
+                                    if is_to_match && search.has_needle() && !search.is_settled() {
+                                        pending_copy_search = Some(PendingCopySearch {
+                                            epoch: input.epoch,
+                                            steps: Vec::new(),
+                                        });
+                                    } else {
+                                        pending_copy_search = None;
+                                    }
+                                    dirty = true;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    pending_copy_search = None;
+                                    fail_copy_mode(&mut copy_mode, &shared, error);
+                                    dirty = true;
+                                }
+                            }
+                        },
                         Ok(DataCommand::Visible(value)) => { if value && !visible { dirty = true; } else if !value && let Some(terminal) = &stream.terminal { selection.stop(terminal)?; } visible = value; }
-                        Ok(DataCommand::Scroll(delta)) => if let Some(terminal) = &mut stream.terminal { prompt_anchor = false; terminal.scroll_viewport(ghostty_vt::terminal::ScrollViewport::Delta(delta)); selection.after_scroll(terminal)?; dirty = true; },
+                        Ok(DataCommand::Scroll(delta)) => if let Some(terminal) = &mut stream.terminal {
+                            prompt_anchor = false;
+                            pending_copy_search = None;
+                            let before = terminal.scrollbar()?.offset as usize;
+                            terminal.scroll_viewport(ghostty_vt::terminal::ScrollViewport::Delta(delta));
+                            selection.after_scroll(terminal)?;
+                            if let Err(error) = copy_mode.after_viewport_scroll_delta(terminal, before, delta) {
+                                fail_copy_mode(&mut copy_mode, &shared, error);
+                            }
+                            dirty = true;
+                        },
                         Ok(DataCommand::CursorStyle(shape)) => { cursor_style = shape; stream.set_cursor_style(shape)?; dirty = true; },
                         Ok(DataCommand::PromptStep(older)) => if let Some(terminal) = &mut stream.terminal {
+                            pending_copy_search = None;
                             let before = terminal.scrollbar()?.offset;
                             terminal.scroll_viewport(ghostty_vt::terminal::ScrollViewport::DeltaPrompt(if older { -1 } else { 1 }));
                             if terminal.scrollbar()?.offset != before {
                                 prompt_anchor = !terminal.is_viewport_active()?;
                             }
                             selection.after_scroll(terminal)?;
+                            if let Err(error) = copy_mode.after_viewport_scroll(terminal) {
+                                fail_copy_mode(&mut copy_mode, &shared, error);
+                            }
                             dirty = true;
                         },
-                        Ok(DataCommand::Bottom) => if let Some(terminal) = &mut stream.terminal { prompt_anchor = false; terminal.scroll_viewport(ghostty_vt::terminal::ScrollViewport::Bottom); dirty = true; },
+                        Ok(DataCommand::Bottom) => if let Some(terminal) = &mut stream.terminal {
+                            prompt_anchor = false;
+                            pending_copy_search = None;
+                            terminal.scroll_viewport(ghostty_vt::terminal::ScrollViewport::Bottom);
+                            if let Err(error) = copy_mode.after_scroll_bottom(terminal) {
+                                fail_copy_mode(&mut copy_mode, &shared, error);
+                            }
+                            dirty = true;
+                        },
                         // A search that fails is dropped with a notice; the terminal's stream is not its to end.
-                        Ok(DataCommand::Search(needle)) => { prompt_anchor = false; if let Err(error) = search.set_needle(stream.terminal.as_ref(), needle) { search = Default::default(); shared.update(|m| m.notice = Some(format!("Search failed: {error:#}"))); } dirty = true; },
+                        Ok(DataCommand::Search(needle)) => {
+                            prompt_anchor = false;
+                            pending_copy_search = None;
+                            if let Err(error) = search.set_needle(stream.terminal.as_ref(), needle) {
+                                search = Default::default();
+                                shared.update(|m| m.notice = Some(format!("Search failed: {error:#}")));
+                            }
+                            dirty = true;
+                        }
                         // Ghostty scrolls the selected match into view.
-                        Ok(DataCommand::SearchStep(older)) => if let Some(terminal) = &stream.terminal { prompt_anchor = false; if let Err(error) = search.step(terminal, older) { search = Default::default(); shared.update(|m| m.notice = Some(format!("Search failed: {error:#}"))); } selection.after_scroll(terminal)?; dirty = true; },
+                        Ok(DataCommand::SearchStep(older)) => if let Some(terminal) = &mut stream.terminal {
+                            prompt_anchor = false;
+                            if search.has_needle()
+                                && !search.is_settled()
+                                && let Some(epoch) = copy_mode.active_epoch()
+                            {
+                                pending_copy_search
+                                    .get_or_insert(PendingCopySearch {
+                                        epoch,
+                                        steps: Vec::new(),
+                                    })
+                                    .steps
+                                    .push(older);
+                            } else {
+                                if let Err(error) = search.step(terminal, older) {
+                                    search = Default::default();
+                                    pending_copy_search = None;
+                                    shared.update(|m| m.notice = Some(format!("Search failed: {error:#}")));
+                                }
+                                selection.after_scroll(terminal)?;
+                                if copy_mode.is_active()
+                                    && let Err(error) = copy_mode.move_to_match(terminal, &search)
+                                {
+                                    fail_copy_mode(&mut copy_mode, &shared, error);
+                                }
+                            }
+                            dirty = true;
+                        },
                         Ok(DataCommand::Reconnect) => { shared.status("Reconnecting terminal…", false); return Ok(false); }
                         Ok(DataCommand::Stop) | Err(_) => return Ok(true),
                     },
@@ -2405,22 +3789,84 @@ async fn run_data(
                         if stream.render_held(Instant::now())? { continue; }
                         if let Some(terminal) = &mut stream.terminal {
                             selection.tick(terminal)?;
-                            let search_pending = match search.update(terminal) {
+                            let mut search_pending = match search.update(terminal) {
                                 Ok(pending) => pending,
-                                Err(error) => { search = Default::default(); shared.update(|m| m.notice = Some(format!("Search failed: {error:#}"))); false }
+                                Err(error) => {
+                                    search = Default::default();
+                                    pending_copy_search = None;
+                                    shared.update(|m| m.notice = Some(format!("Search failed: {error:#}")));
+                                    false
+                                }
                             };
+                            if search_pending && pending_copy_search.is_some() {
+                                for _ in 0..64 {
+                                    match search.update(terminal) {
+                                        Ok(false) => {
+                                            search_pending = false;
+                                            break;
+                                        }
+                                        Ok(true) => {}
+                                        Err(error) => {
+                                            search = Default::default();
+                                            pending_copy_search = None;
+                                            shared.update(|m| m.notice = Some(format!("Search failed: {error:#}")));
+                                            search_pending = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if !search_pending
+                                && let Some(pending) = pending_copy_search.take()
+                                && copy_mode.active_epoch() == Some(pending.epoch)
+                                && search.has_needle()
+                            {
+                                let mut failed = false;
+                                for older in pending.steps {
+                                    if let Err(error) = search.step(terminal, older) {
+                                        search = Default::default();
+                                        shared.update(|m| m.notice = Some(format!("Search failed: {error:#}")));
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                                if !failed {
+                                    selection.after_scroll(terminal)?;
+                                    if let Err(error) = copy_mode.move_to_match(terminal, &search) {
+                                        fail_copy_mode(&mut copy_mode, &shared, error);
+                                    }
+                                }
+                            }
+                            if let Err(error) = copy_mode.sync(terminal) {
+                                fail_copy_mode(&mut copy_mode, &shared, error);
+                            }
                             let mut frame = renderer.frame(terminal)?;
                             if terminal.is_viewport_active()? { prompt_anchor = false; }
                             frame.prompt_anchor = prompt_anchor;
-                            frame.selection_revision = selection.revision;
+                            frame.selection_revision = selection_revision;
+                            frame.copy = match copy_mode.view(terminal) {
+                                Ok(view) => view,
+                                Err(error) => {
+                                    fail_copy_mode(&mut copy_mode, &shared, error);
+                                    None
+                                }
+                            };
                             frame.search = match search.results(terminal) {
                                 Ok(results) => results,
                                 Err(error) => { search = Default::default(); shared.update(|m| m.notice = Some(format!("Search failed: {error:#}"))); None }
                             };
                             let frame = Arc::new(frame);
+                            let yank = pending_yank.take();
+                            let ended = copy_mode.ended_epoch();
                             let mut transitioned = false;
                             shared.update(|m| {
                                 m.frame = Some(frame);
+                                if let Some(yank) = yank {
+                                    m.copy_yank = Some(yank);
+                                }
+                                if ended > m.copy_ended_epoch {
+                                    m.copy_ended_epoch = ended;
+                                }
                                 if !m.connected { m.connected = true; m.status = "Live · snapshot restored".into(); transitioned = true; }
                                 if let Some(code) = stream.exit_code { m.status = format!("Process exited · {code}"); }
                             });
@@ -2449,6 +3895,12 @@ async fn run_data(
             }
         }
     }
+}
+
+/// Queued copy-mode jump/steps waiting for an in-flight search scan to settle.
+struct PendingCopySearch {
+    epoch: u64,
+    steps: Vec<bool>,
 }
 
 async fn open_data(

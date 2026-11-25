@@ -13,11 +13,14 @@ pub fn format_version(version: &str) -> String {
 
 pub mod connection;
 pub mod download;
+pub mod hosts;
 pub mod keymap;
+pub mod layers;
 pub mod layout;
 pub mod legacy;
 pub mod links;
 pub mod platform;
+pub mod ports;
 pub mod qr;
 pub mod settings;
 pub mod ssh;

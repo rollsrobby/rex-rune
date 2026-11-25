@@ -61,9 +61,10 @@ fn narrow_bar(s: &Workspace) -> bool {
 /// receiving download each take a chip's worth of the row, so on a narrow bar the identity keeps
 /// its floor and lets them and the bar's controls fit; otherwise it is as wide as its words.
 fn live_chip_shown(s: &Workspace) -> bool {
-    s.key_mode().is_some()
+    s.has_mode_chip()
         || s.settings.terminal.key_sequence_hints
             && s.bindings.pending_label(s.effective_keymap()).is_some()
+        || s.has_waiting_prompt()
         || super::downloads_view::chip_label(s).is_some()
 }
 
@@ -319,7 +320,10 @@ pub(super) fn tab_track(s: &Workspace, track: f32, pill: f32) -> El {
                 &LEFT,
                 "Scroll previous tabs",
                 26.,
-                |s, tx| s.scroll_tabs(-1, tx),
+                |s, tx| {
+                    s.clear_focus_history_walk();
+                    s.scroll_tabs(-1, tx);
+                },
             )
             .live_opacity(&s.tab_fade[0]),
         );
@@ -329,7 +333,8 @@ pub(super) fn tab_track(s: &Workspace, track: f32, pill: f32) -> El {
         track = track
             .child(
                 chrome_button("next-tabs", &RIGHT, "Scroll next tabs", 26., |s, tx| {
-                    s.scroll_tabs(1, tx)
+                    s.clear_focus_history_walk();
+                    s.scroll_tabs(1, tx);
                 })
                 .live_opacity(&s.tab_fade[1]),
             )
@@ -468,6 +473,29 @@ pub(super) fn download_chip(s: &Workspace) -> El {
 /// truncates, and a narrow bar gives the `mode` word's room to the name. The accessible name
 /// and the tooltip keep the whole name at every width.
 pub fn mode_chip(s: &Workspace) -> Option<El> {
+    if let Some(copy_label) = s.copy_mode_chip_label() {
+        let words = row()
+            .key("mode-chip")
+            .role("status")
+            .h(28.)
+            .shrink()
+            .min_w(MODE_CHIP_FLOOR)
+            .max_w(150.)
+            .px(8.)
+            .gap(5.)
+            .center_y()
+            .label(format!("Copy mode: {copy_label}"))
+            .help(format!("Copy mode ({copy_label}) · Escape or q to leave"));
+        return Some(chip(
+            words.child(
+                text(copy_label)
+                    .key("mode-name")
+                    .font(medium(11.5))
+                    .color(rgb(ink()))
+                    .truncate(),
+            ),
+        ));
+    }
     let name = s.key_mode()?;
     let mut words = row()
         .key("mode-chip")
@@ -522,12 +550,18 @@ pub fn sequence_chip(s: &Workspace) -> Option<El> {
     ))
 }
 
+/// One chip while a `rex.ui` question waits for the user, styled in `WARNING`.
+pub fn prompt_chip(s: &Workspace) -> Option<El> {
+    super::prompts::chip(s, narrow_bar(s))
+}
+
 /// Only live status chips float when the toolbar is absent, never invisible bar controls.
 pub fn floating_status(s: &Workspace) -> Option<El> {
     let mode = mode_chip(s);
     let sequence = sequence_chip(s);
+    let prompt = prompt_chip(s);
     let download = super::downloads_view::chip_label(s).is_some();
-    if mode.is_none() && sequence.is_none() && !download {
+    if mode.is_none() && sequence.is_none() && prompt.is_none() && !download {
         return None;
     }
     Some(
@@ -535,6 +569,7 @@ pub fn floating_status(s: &Workspace) -> Option<El> {
             .gap(8.)
             .children(mode)
             .children(sequence)
+            .children(prompt)
             .children(download.then(|| download_chip(s))),
     )
 }
@@ -569,6 +604,7 @@ pub fn toolbar(s: &Workspace) -> El {
         })
         .children(mode_chip(s))
         .child(sequence_chip(s).unwrap_or_else(el))
+        .children(prompt_chip(s))
         .children(activity_chip(s))
         .child(download_chip(s))
         // Always at least 48pt of window to drag, outside the tabs.

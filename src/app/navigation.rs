@@ -264,6 +264,8 @@ impl Workspace {
         timeout: Duration,
         tx: &mut Tx,
     ) {
+        self.clear_focus_history_walk();
+        self.exit_copy_mode();
         self.navigation.serial += 1;
         let now = Instant::now();
         self.navigation.pending = Some(Pending {
@@ -292,8 +294,14 @@ impl Workspace {
             self.navigation.cancel();
             return;
         };
+        if self.ports_target().is_some_and(|target| {
+            target.host != visit.host || target.session.as_deref() != Some(&visit.session)
+        }) {
+            self.close_panel(tx);
+        }
         self.active = host;
         self.drag = None;
+        self.layer_drag = None;
         self.settings.hosts[host].collapsed = false;
         self.update_visibility();
         if !self.hosts[host].model.connected {

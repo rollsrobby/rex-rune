@@ -2,7 +2,10 @@
 
 Rex Rune is an unofficial, independent native client for [Rex](https://www.superlogical.com/rex),
 the terminal multiplexer from Superlogical. It attaches to an existing Rex
-server, so sessions, panes and programs stay on the server when the app closes.
+server. Closing the app detaches without stopping the server or its sessions.
+A [personal server started over SSH](docs/hosts.md#ssh-setup) runs until it is
+stopped or the host restarts. On Linux with systemd, logging out of the host
+also ends the server and its sessions unless lingering is enabled for that login.
 It is written in Rust on [Rune](https://github.com/anomalyco/rune) with
 libghostty-vt for terminal emulation and the
 [`rexrs`](https://github.com/a10y/rexrs) control SDK. Published binaries are
@@ -35,7 +38,8 @@ client, launcher and icons, never the `rex` server.
   transport and admission rules.
 - **Sessions and tabs.** A host contains sessions; each session's Rex windows
   become tabs. Searchable switcher (`Ctrl K`), optional sidebar, Back/Forward
-  history and a `<tab> - <session> · <host>` window title.
+  history, server-side focus history (API 19+, across panes, tabs and sessions)
+  and a `<tab> - <session> · <host>` window title.
 - **Tab management.** Tabs close behind a confirmation, rename, mute, reorder in
   server order, close others or fill the toolbar; optional generated program and
   directory titles.
@@ -63,6 +67,11 @@ client, launcher and icons, never the `rex` server.
 - **Downloads.** **Download file…** saves from the terminal's machine (API 13+),
   with progress and partial cleanup, and never overwrites, opens or runs the
   file.
+- **Listening ports.** **Show listening ports…** in Commands lists TCP listeners
+  in this session (API 15+); the pane menu puts that pane first. Enter copies the
+  bind address. Ctrl+Enter (Cmd+Enter on macOS) opens supported ports on Unix-socket
+  hosts or copies an `ssh -L` command for SSH hosts.
+  [Scope and limits](docs/parity-2026-11/listening-ports.md#slice-2-ui).
 - **Fonts and themes.** Chrome palettes, terminal themes declared to the server
   including Ghostty files, installed fonts with a picker and ordered fallbacks,
   bundled IBM Plex Mono and Symbols Nerd Font, font size and live metrics.
@@ -82,10 +91,7 @@ client, launcher and icons, never the `rex` server.
   recording, with host-defined modes, the innermost active one named in a chip,
   and multi-key sequences. Commands lists actions; Rex action compatibility is
   a focused subset, not Mac parity.
-- **Remote control.** Off by default for every host; exactly eight navigation
-  actions can zoom panes and switch the display to the requesting host, but none
-  can type, use the clipboard, open dialogs, change interface zoom or act on
-  another host.
+- **Remote control and script prompts.** Remote control is off by default for every host; eight view-only actions can zoom panes and switch the display to the requesting host, and `client.tab.mute` can mute or unmute a named tab on that host unattended, while none can type, use the clipboard, open dialogs, change interface zoom or act on another host. On API 17+ hosts, Lua scripts and actions can ask `rex.ui.input` and `rex.ui.pick` questions in an anti-spoofing modal (or waiting toolbar chip) controlled per host by **Allow script prompts** in Settings -> Remote Hosts.
 - **Settings and maintenance.** Server facts, duration, confirmed **Stop
   server…** and a local **Pair device…** QR dialog that sends no server request;
   Interface, Terminal, Shortcuts, Integrations, Notifications, Remote Hosts,
@@ -105,7 +111,7 @@ hands-on acceptance on every desktop.
 
 | Area | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| Published builds | Stable x86_64 and aarch64 binaries, current **0.10.0**; pacman, `.deb`, tarball, `install.sh`, Nix | Source only; no release, installer or notarization | Source only for MSVC; no release or installer |
+| Published builds | Stable x86_64 and aarch64 binaries, [latest release](https://github.com/shuv1337/rex-rune/releases/latest); pacman, `.deb`, tarball, `install.sh`, Nix | Source only; no release, installer or notarization | Source only for MSVC; no release or installer |
 | Native UI and input | Exercised with private X11 and Wayland fixtures, not every desktop, compositor or input method | Title row and window checked by hand on macOS 27 Apple silicon; physical Option, dead keys and Finder-started acceptance not checked | Full unit/headless suite in CI (993 passed, 4 ignored); native window, physical input, clipboard, IME, HiDPI and server attachment untested |
 | Server attachment | Unix socket, HTTPS/WSS and SSH hosts | Local socket, HTTPS/WSS and SSH hosts checked from source builds | Network endpoints compile through the unchanged TCP/Rustls path; untested. Unix sockets and SSH hosts are refused; no named pipes |
 | Links and folders | `xdg-open` and the file manager | `open` and Finder | **Not available**: opening a link or Show in folder fails with the system's "program not found" |
@@ -206,7 +212,7 @@ details are in [Building and
 development](docs/building.md#vendored-dependencies).
 
 Thanks to [Superlogical Rex](https://www.superlogical.com/rex) for the server
-and protocol this client follows (API revision 13, with revisions 10–12 also
+and protocol this client follows (API revision 21, with revisions 10-20 also
 supported), and to [m4nik1/rex-linux-client](https://github.com/m4nik1/rex-linux-client)
 and [noahdunnagan/rmx](https://github.com/noahdunnagan/rmx) for protocol work
 that served as references.

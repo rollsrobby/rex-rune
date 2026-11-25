@@ -99,8 +99,10 @@ fn every_menu_separates_its_groups_and_ends_with_its_destructive_row() {
         label: "other".into(),
         endpoint: "unix:///nonexistent/rex-test-other.sock".into(),
         remote_control: false,
+        prompts: true,
         collapsed: false,
         shell: None,
+        shared: None,
     });
     ws.hosts[0].model.sessions = vec![session("s"), session("next")];
     let mut rt = runtime(ws);
@@ -110,7 +112,7 @@ fn every_menu_separates_its_groups_and_ends_with_its_destructive_row() {
     assert_structured(&rt, "pane", "Close pane…");
     assert_eq!(
         rows(&rt).iter().map(|r| r.1).collect::<Vec<_>>(),
-        [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4],
+        [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4],
         "clipboard, layout (four sides and Zoom), the pane itself, its terminal, Close"
     );
     assert_eq!(label_color(&mut rt, "Close pane…"), rgb(danger()));
@@ -175,6 +177,7 @@ fn commands_keep_destructive_rows_last_and_a_filtered_list_is_flat() {
             "Close pane or tab…",
             "Close other panes…",
             "Close pane…",
+            "Close floating layer…",
             "Stop server…",
             "Remove host test-0…",
         ]

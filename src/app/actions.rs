@@ -8,12 +8,15 @@ use serde_json::{Value, json};
 pub const SEARCH: &str = "client.search";
 pub const SELECT_SESSION: &str = "session.select";
 pub const LAST_SESSION: &str = "client.session.last";
+pub const MUTE_TAB: &str = "client.tab.mute";
 pub const NEXT_GLOBAL: &str = "client.tab.next_global";
 pub const PREVIOUS_GLOBAL: &str = "client.tab.previous_global";
 pub const HISTORY_BACK: &str = "client.history.back";
 pub const HISTORY_FORWARD: &str = "client.history.forward";
+pub const FOCUS_HISTORY_REVERSE: &str = "client.focus_history.reverse";
 pub const DOWNLOAD: &str = "pane.download";
 pub const FULL_SCREEN: &str = "client.full_screen.toggle";
+pub const UNDO_CLOSE: &str = "client.undo_close";
 
 #[derive(Clone, Copy)]
 enum Handler {
@@ -24,6 +27,7 @@ enum Handler {
     Sidebar,
     FullScreen,
     Close,
+    UndoClose,
     Search,
     NewTab,
     NextTab,
@@ -32,12 +36,14 @@ enum Handler {
     PreviousGlobal,
     Back,
     Forward,
+    FocusHistoryReverse,
     ZoomIn,
     ZoomOut,
     ZoomReset,
     SwitchSession,
     LastSession,
     Activity,
+    Ports,
     PairDevice,
     StopServer,
     SelectSession,
@@ -46,6 +52,14 @@ enum Handler {
     ZoomPane,
     FocusPane,
     PaneActions,
+    FloatPane,
+    NewFloatingPane,
+    MinimizeLayer,
+    RestoreLayer,
+    RaiseLayer,
+    ReturnToTiles,
+    CloseLayer,
+    CopyMode,
     Copy,
     Paste,
     Reconnect,
@@ -114,12 +128,14 @@ specs! {
     PREVIOUS_GLOBAL => PreviousGlobal,
     HISTORY_BACK => Back,
     HISTORY_FORWARD => Forward,
+    FOCUS_HISTORY_REVERSE => FocusHistoryReverse,
     "client.zoom.in" => ZoomIn,
     "client.zoom.out" => ZoomOut,
     "client.zoom.reset" => ZoomReset,
     "session.switch" => SwitchSession,
     LAST_SESSION => LastSession,
     super::activity_list::ACTION => Activity,
+    super::ports::ACTION => Ports,
     super::pair_device::ACTION => PairDevice,
     super::server_page::STOP => StopServer,
     SELECT_SESSION => SelectSession,
@@ -128,6 +144,14 @@ specs! {
     "pane.zoom" => ZoomPane,
     "pane.focus" => FocusPane,
     "pane.actions" => PaneActions,
+    "pane.float" => FloatPane,
+    "pane.new_floating" => NewFloatingPane,
+    "pane.minimize_layer" => MinimizeLayer,
+    "pane.restore_layer" => RestoreLayer,
+    "pane.raise_layer" => RaiseLayer,
+    "pane.return_to_tiles" => ReturnToTiles,
+    "pane.close_layer" => CloseLayer,
+    super::copy_mode::ACTION => CopyMode,
     "pane.copy" => Copy,
     "pane.paste" => Paste,
     "pane.reconnect" => Reconnect,
@@ -137,6 +161,7 @@ specs! {
     "client.tab.rename" => RenameTab,
     "session.rename" => RenameSession,
     "pane.close" => ClosePane,
+    UNDO_CLOSE => UndoClose,
     "pane.send_key" => SendKey,
     DOWNLOAD => Download,
     super::directory::ACTION => InsertPath,
@@ -150,7 +175,7 @@ specs! {
     super::find::NEXT => FindNext,
     super::find::PREVIOUS => FindPrevious,
     "client.tab.move" => MoveTab,
-    "client.tab.mute" => MuteTab,
+    MUTE_TAB => MuteTab,
     "client.tab.close_others" => CloseOtherTabs,
     super::splits::FOCUS_NEXT => FocusNextPane,
     super::splits::FOCUS_PREVIOUS => FocusPreviousPane,
@@ -217,7 +242,11 @@ pub fn find(name: &str) -> Option<&'static Spec> {
 /// Exhaustive by handler: new actions require an explicit remote decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remote {
-    View { navigation: bool },
+    View {
+        navigation: bool,
+    },
+    /// Local per-tab presentation/notification state, explicitly targeted and idempotent.
+    TabState,
     Never(&'static str),
 }
 
@@ -238,16 +267,24 @@ impl Spec {
             Copy => Remote::Never(
                 "Use rex capture instead; remote actions cannot change this computer's clipboard.",
             ),
+            CopyMode => Remote::Never("Only the person at this computer can enter copy mode."),
             SendKey => Remote::Never("Use rex send-key instead."),
             NewSession => Remote::Never("Use rex new instead."),
             NewTab => Remote::Never("Use rex window new instead."),
             Split => Remote::Never("Use rex split instead."),
             Close | ClosePane => Remote::Never("Use rex block close instead."),
+            UndoClose => Remote::Never("Only the person at this computer can undo a close."),
+            FloatPane => Remote::Never("Use rex api call session.float_block instead."),
+            NewFloatingPane => Remote::Never("Use rex api call session.new_layer instead."),
+            MinimizeLayer | RestoreLayer => {
+                Remote::Never("Use rex api call session.set_layer_state instead.")
+            }
+            RaiseLayer => Remote::Never("Use rex api call session.raise_layer instead."),
+            ReturnToTiles => Remote::Never("Use rex api call session.move_block instead."),
+            CloseLayer => Remote::Never("Use rex api call session.close_layer instead."),
             CloseTab | CloseOtherTabs => Remote::Never("Use rex window close instead."),
             MoveTab => Remote::Never("Use rex window move instead."),
-            MuteTab => Remote::Never(
-                "Only the person at this computer can mute this client's notifications.",
-            ),
+            MuteTab => Remote::TabState,
             RenameTab => Remote::Never("Use rex window rename instead."),
             RenameSession => Remote::Never("Use rex session rename instead."),
             InsertPath | GoToDirectory => Remote::Never(
@@ -257,7 +294,7 @@ impl Spec {
                 "Only the person at this computer can choose a file to download; nothing a host sends can start one.",
             ),
             Palette | Settings | Search | SwitchSession | Activity | PairDevice | StopServer
-            | PaneActions | Shortcuts => {
+            | PaneActions | Shortcuts | Ports => {
                 Remote::Never("Only the person at this computer can open dialogs and popups.")
             }
             ZoomIn | ZoomOut | ZoomReset => Remote::Never(
@@ -265,6 +302,9 @@ impl Spec {
             ),
             NextGlobal | PreviousGlobal | Back | Forward | LastSession => {
                 Remote::Never("Use rex do session.select on the target host instead.")
+            }
+            FocusHistoryReverse => {
+                Remote::Never("Only the person at this computer can step through focus history.")
             }
             Reconnect => Remote::Never("Only the person at this computer can reconnect terminals."),
             SelectAll => {
@@ -316,16 +356,34 @@ impl Spec {
         matches!(
             self.handler,
             Handler::Download
+                | Handler::Ports
                 | Handler::InsertPath
                 | Handler::GoToDirectory
                 | Handler::PairDevice
                 | Handler::StopServer
+                | Handler::UndoClose
+                | Handler::FocusHistoryReverse
         )
     }
     pub fn global(&self) -> bool {
         matches!(
             self.handler,
             Handler::ZoomIn | Handler::ZoomOut | Handler::ZoomReset
+        )
+    }
+
+    /// Actions that write to the PTY or replace terminal selection and must be swallowed
+    /// while copy mode is active.
+    pub fn blocked_in_copy_mode(&self) -> bool {
+        matches!(
+            self.handler,
+            Handler::Paste
+                | Handler::SendKey
+                | Handler::ClearTerminal
+                | Handler::ResetTerminal
+                | Handler::InsertPath
+                | Handler::GoToDirectory
+                | Handler::SelectAll
         )
     }
     pub fn repeats(&self) -> bool {
@@ -379,12 +437,14 @@ impl Spec {
             Handler::PreviousGlobal => "Previous tab across hosts",
             Handler::Back => "Back in history",
             Handler::Forward => "Forward in history",
+            Handler::FocusHistoryReverse => "Previous focus",
             Handler::ZoomIn => "Increase interface zoom",
             Handler::ZoomOut => "Decrease interface zoom",
             Handler::ZoomReset => "Reset interface zoom",
             Handler::SwitchSession => "Switch session",
             Handler::LastSession => "Last session",
             Handler::Activity => "Show activity",
+            Handler::Ports => "Show listening ports",
             Handler::PairDevice => "Pair device…",
             Handler::StopServer => "Stop server…",
             Handler::SelectSession => "Show session",
@@ -393,6 +453,14 @@ impl Spec {
             Handler::ZoomPane => "Zoom pane",
             Handler::FocusPane => "Focus pane",
             Handler::PaneActions => "Pane actions",
+            Handler::FloatPane => "Float pane",
+            Handler::NewFloatingPane => "New floating pane",
+            Handler::MinimizeLayer => "Minimize floating layer",
+            Handler::RestoreLayer => "Restore and focus floating layer",
+            Handler::RaiseLayer => "Bring floating layer to front",
+            Handler::ReturnToTiles => "Return pane to tiles",
+            Handler::CloseLayer => "Close floating layer",
+            Handler::CopyMode => "Copy mode",
             Handler::Copy => "Copy selection",
             Handler::Paste => "Paste",
             Handler::Reconnect => "Reconnect terminal",
@@ -402,6 +470,7 @@ impl Spec {
             Handler::RenameTab => "Rename tab",
             Handler::RenameSession => "Rename session",
             Handler::ClosePane => "Close pane",
+            Handler::UndoClose => "Undo close",
             Handler::SendKey => "Send key",
             Handler::Download => "Download file",
             Handler::InsertPath => "Insert path",
@@ -463,9 +532,11 @@ impl Spec {
             | Handler::PreviousGlobal
             | Handler::Back
             | Handler::Forward
+            | Handler::FocusHistoryReverse
             | Handler::SwitchSession
             | Handler::LastSession
             | Handler::Activity
+            | Handler::Ports
             | Handler::SelectSession
             | Handler::GotoTab
             | Handler::NextSession
@@ -478,6 +549,7 @@ impl Spec {
             | Handler::RenameTab
             | Handler::RenameSession
             | Handler::ClosePane
+            | Handler::UndoClose
             | Handler::MoveTab
             | Handler::MuteTab
             | Handler::CloseOtherTabs
@@ -494,8 +566,16 @@ impl Spec {
             | Handler::ClearTerminal
             | Handler::ResetTerminal
             | Handler::FocusNextPane
-            | Handler::FocusPreviousPane => "Panes",
-            Handler::Copy
+            | Handler::FocusPreviousPane
+            | Handler::FloatPane
+            | Handler::NewFloatingPane
+            | Handler::MinimizeLayer
+            | Handler::RestoreLayer
+            | Handler::RaiseLayer
+            | Handler::ReturnToTiles
+            | Handler::CloseLayer => "Panes",
+            Handler::CopyMode
+            | Handler::Copy
             | Handler::Paste
             | Handler::SelectAll
             | Handler::Scroll
@@ -517,10 +597,33 @@ impl Spec {
                 json!({"type":"object","properties":{"view":{"type":"string","enum":["priority","session"]}},"additionalProperties":false}),
             );
         }
+        if matches!(self.handler, Handler::FocusHistoryReverse) {
+            return Some(json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": rex_rune::connection::FocusHistoryScope::ALL_ARGS
+                    }
+                },
+                "additionalProperties": false
+            }));
+        }
         if matches!(self.handler, Handler::SelectSession) {
             return Some(
                 json!({"type":"object","properties":{"session_id":{"type":"string","minLength":1},"window_id":{"type":"string","minLength":1}},"required":["session_id"],"additionalProperties":false}),
             );
+        }
+        if matches!(self.handler, Handler::MuteTab) {
+            return Some(json!({
+                "type": "object",
+                "properties": {
+                    "window_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "muted": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            }));
         }
         let (key, schema) = match self.handler {
             Handler::Split => (
@@ -579,6 +682,13 @@ impl Spec {
                     || object.len() == 1
                         && matches!(args["view"].as_str(), Some("priority" | "session"))
             }
+            Handler::FocusHistoryReverse => {
+                object.is_empty()
+                    || object.len() == 1
+                        && args["scope"].as_str().is_some_and(|s| {
+                            rex_rune::connection::FocusHistoryScope::parse(s).is_some()
+                        })
+            }
             Handler::Split => object.len() == 1 && split_way(args).is_some(),
             Handler::FocusPane => {
                 object.len() == 1
@@ -606,6 +716,21 @@ impl Spec {
                         Some("left" | "right" | "backward" | "forward")
                     )
             }
+            Handler::MuteTab => {
+                let valid_id = |v: &Value| {
+                    v.as_str().is_some_and(|id| {
+                        !id.trim().is_empty() && id.chars().count() <= 128 && id.len() <= 512
+                    })
+                };
+                object
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "window_id" | "session_id" | "muted"))
+                    && object.get("window_id").is_none_or(valid_id)
+                    && object
+                        .get("session_id")
+                        .is_none_or(|id| object.contains_key("window_id") && valid_id(id))
+                    && object.get("muted").is_none_or(Value::is_boolean)
+            }
             Handler::SendKey => {
                 object.len() == 1
                     && args["key"]
@@ -622,6 +747,12 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
     let Some(spec) = find(name).filter(|spec| spec.accepts(args)) else {
         return false;
     };
+    if s.in_copy_mode() && spec.blocked_in_copy_mode() {
+        return true;
+    }
+    if !matches!(spec.handler, Handler::FocusHistoryReverse) {
+        s.clear_focus_history_walk();
+    }
     match spec.handler {
         Handler::Compatibility => super::compatibility::run(s, name, args, tx),
         Handler::Palette => s.picker(false),
@@ -632,6 +763,7 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
         Handler::Toolbar => s.toggle_toolbar(),
         Handler::FullScreen => tx.toggle_full_screen(),
         Handler::Close => s.close_focused(tx),
+        Handler::UndoClose => s.undo_close(),
         Handler::Search => s.open_search(),
         Handler::FindNext => s.find_step(true),
         Handler::FindPrevious => s.find_step(false),
@@ -642,6 +774,13 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
         Handler::PreviousGlobal => s.cycle_tab(-1, tx),
         Handler::Back => s.navigate_history(-1, tx),
         Handler::Forward => s.navigate_history(1, tx),
+        Handler::FocusHistoryReverse => {
+            let scope = args["scope"]
+                .as_str()
+                .and_then(rex_rune::connection::FocusHistoryScope::parse)
+                .unwrap_or_default();
+            s.reverse_focus_history(scope, tx);
+        }
         Handler::ZoomIn => s.change_ui_scale(1, tx),
         Handler::ZoomOut => s.change_ui_scale(-1, tx),
         Handler::ZoomReset => s.change_ui_scale(0, tx),
@@ -657,6 +796,7 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
             }
             s.show_activity();
         }
+        Handler::Ports => s.show_ports(s.focused_block()),
         Handler::PairDevice => s.pair_device(),
         Handler::StopServer => s.stop_server(),
         Handler::SelectSession => {
@@ -679,7 +819,30 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
                 s.pane_menu(block, None);
             }
         }
+        Handler::FloatPane
+        | Handler::NewFloatingPane
+        | Handler::MinimizeLayer
+        | Handler::RestoreLayer
+        | Handler::RaiseLayer
+        | Handler::ReturnToTiles
+        | Handler::CloseLayer => {
+            use super::panel::LayerAction;
+            let verb = match spec.handler {
+                Handler::FloatPane => LayerAction::Float,
+                Handler::NewFloatingPane => LayerAction::NewFloating,
+                Handler::MinimizeLayer => LayerAction::Minimize,
+                Handler::RestoreLayer => LayerAction::Focus,
+                Handler::RaiseLayer => LayerAction::Raise,
+                Handler::ReturnToTiles => LayerAction::ReturnToTiles,
+                _ => LayerAction::Close,
+            };
+            s.focused_layer_action(verb);
+        }
+        Handler::CopyMode => s.enter_copy_mode(tx),
         Handler::Copy => {
+            if s.yank_copy_mode_selection() {
+                return true;
+            }
             if let Some(text) = s.active_terminal().and_then(|t| t.copy_text()) {
                 tx.copy(text);
             }
@@ -760,10 +923,22 @@ pub fn run(s: &mut Workspace, name: &str, args: &Value, tx: &mut Tx) -> bool {
                 s.perform(Intent::Pane(target, verb), tx);
             }
         }
-        Handler::MoveTab | Handler::MuteTab | Handler::CloseOtherTabs => {
+        Handler::MuteTab => {
+            let target = if let Some(window_id) = args["window_id"].as_str() {
+                s.find_tab(s.active, window_id, args["session_id"].as_str())
+            } else {
+                s.active_tab()
+            };
+            if let Some(target) = target {
+                let muted = args["muted"]
+                    .as_bool()
+                    .unwrap_or_else(|| !s.tab_muted(target.host, &target.window));
+                s.set_tab_muted(&target, muted);
+            }
+        }
+        Handler::MoveTab | Handler::CloseOtherTabs => {
             use super::tabs::TabAction;
             let action = match spec.handler {
-                Handler::MuteTab => TabAction::Mute,
                 Handler::CloseOtherTabs => TabAction::CloseOthers,
                 _ if matches!(args["direction"].as_str(), Some("left" | "backward")) => {
                     TabAction::MoveLeft
@@ -913,9 +1088,23 @@ pub fn binding_title(binding: &rexrs::api::client::Binding) -> String {
                 args["view"].as_str().unwrap_or_default()
             )
         }
+        FOCUS_HISTORY_REVERSE => match args["scope"].as_str() {
+            Some("pane") => "Previous focused pane in tab".into(),
+            Some("tab") => "Previous focused tab".into(),
+            Some("tab_any_session") => "Previous focused tab (any session)".into(),
+            Some("session") => "Previous focused session".into(),
+            _ => title.into(),
+        },
         "pane.split" => format!("Split {}", direction()),
         "pane.focus" => format!("Focus pane {}", direction()),
         "client.tab.move" => format!("Move tab {}", direction()),
+        "client.tab.mute" if args.as_object().is_some_and(|o| o.len() == 1) => {
+            match args["muted"].as_bool() {
+                Some(true) => "Mute tab".into(),
+                Some(false) => "Unmute tab".into(),
+                None => title.into(),
+            }
+        }
         "pane.scroll" => {
             let lines = args["lines"].as_i64().unwrap_or_default();
             let direction = if lines < 0 { "up" } else { "down" };
@@ -938,13 +1127,22 @@ pub fn declarations() -> Vec<rexrs::api::client::InspectResponseAction> {
                 .keywords(s.title())
                 .repeats(s.repeats());
             action.args = s.schema();
-            if let Remote::Never(message) = s.remote() {
-                action.description = Some(format!(
-                    "{}Not available remotely. {message}",
-                    super::compatibility::unsupported(s.name)
-                        .map(|reason| format!("{reason} "))
-                        .unwrap_or_default()
-                ));
+            match s.remote() {
+                Remote::Never(message) => {
+                    action.description = Some(format!(
+                        "{}Not available remotely. {message}",
+                        super::compatibility::unsupported(s.name)
+                            .map(|reason| format!("{reason} "))
+                            .unwrap_or_default()
+                    ));
+                }
+                Remote::TabState => {
+                    action.description = Some(
+                        "Mute or unmute a tab on this client. Remote calls require Remote control for this host and explicit window_id and muted arguments (session_id is optional)."
+                            .into(),
+                    );
+                }
+                Remote::View { .. } => {}
             }
             action
         })

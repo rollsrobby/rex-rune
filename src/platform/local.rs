@@ -50,12 +50,109 @@ pub async fn connect(path: &std::path::Path) -> anyhow::Result<Box<dyn crate::tr
     }
 }
 
+/// Operating system family for platform-specific path tables (such as SSH agent discovery).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostOs {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+pub const HOST_OS: HostOs = if cfg!(target_os = "macos") {
+    HostOs::MacOs
+} else if cfg!(windows) {
+    HostOs::Windows
+} else {
+    HostOs::Linux
+};
+
+/// Whether `ssh://` hosts and SSH agent selection are available on this platform.
+pub const SSH_AVAILABLE: bool = !cfg!(windows);
+
+pub fn ssh_available() -> bool {
+    SSH_AVAILABLE
+}
+
 /// SSH forwards to a local Unix socket. Refuse before discovering or starting anything.
 pub fn require_ssh() -> anyhow::Result<()> {
-    if cfg!(windows) {
+    if !SSH_AVAILABLE {
         anyhow::bail!("ssh:// hosts are not available on Windows yet");
     }
     Ok(())
+}
+
+/// A synchronous byte stream to a local Unix socket.
+pub trait ReadWrite: std::io::Read + std::io::Write {}
+impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnixSocketError {
+    NotFound,
+    NotSocket,
+    WrongType,
+    Refused,
+    PermissionDenied,
+    TimedOut,
+    Unavailable(&'static str),
+    Other(String),
+}
+
+#[cfg(unix)]
+fn classify_unix_connect_error(error: std::io::Error) -> UnixSocketError {
+    use std::io::ErrorKind;
+    // EPROTOTYPE occurs both on live non-stream (SOCK_DGRAM) Unix sockets and on some
+    // macOS/BSD socket teardown races, so report it separately from a missing listener.
+    if error.raw_os_error() == Some(libc::EPROTOTYPE) {
+        return UnixSocketError::WrongType;
+    }
+    if error.raw_os_error() == Some(libc::ENOTSOCK) {
+        return UnixSocketError::NotSocket;
+    }
+    // macOS/BSD XNU can return ECONNRESET, ECONNABORTED, EPIPE, or ENOTCONN when
+    // connecting to a stale or just-closed Unix domain socket.
+    match error.kind() {
+        ErrorKind::NotFound => UnixSocketError::NotFound,
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected => UnixSocketError::Refused,
+        ErrorKind::PermissionDenied => UnixSocketError::PermissionDenied,
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => UnixSocketError::TimedOut,
+        _ => UnixSocketError::Other(error.to_string()),
+    }
+}
+
+/// Connect to a local Unix domain socket with bounded read/write timeouts and run `f`.
+pub fn with_unix_socket<T>(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+    f: impl FnOnce(&mut dyn ReadWrite) -> T,
+) -> Result<T, UnixSocketError> {
+    #[cfg(unix)]
+    {
+        use std::{io::ErrorKind, os::unix::fs::FileTypeExt};
+        let meta = std::fs::metadata(path).map_err(|error| match error.kind() {
+            ErrorKind::NotFound => UnixSocketError::NotFound,
+            ErrorKind::PermissionDenied => UnixSocketError::PermissionDenied,
+            _ => UnixSocketError::Other(error.to_string()),
+        })?;
+        if !meta.file_type().is_socket() {
+            return Err(UnixSocketError::NotSocket);
+        }
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(path).map_err(classify_unix_connect_error)?;
+        let _ = stream.set_read_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(timeout));
+        Ok(f(&mut stream))
+    }
+    #[cfg(windows)]
+    {
+        let _ = (path, timeout, f);
+        Err(UnixSocketError::Unavailable(
+            "SSH agents are not available on Windows yet",
+        ))
+    }
 }
 
 /// Keep the tunnel folder private and remove only dead processes' old socket folders.
@@ -163,6 +260,54 @@ mod tests {
         assert!(own.exists(), "this process's directory stays");
         assert!(other.exists(), "anything else is left alone");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_connect_errors_classify_stale_and_closed_sockets_as_refused() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+        ] {
+            assert_eq!(
+                classify_unix_connect_error(Error::from(kind)),
+                UnixSocketError::Refused,
+                "expected {kind:?} to classify as Refused"
+            );
+        }
+        assert_eq!(
+            classify_unix_connect_error(Error::from_raw_os_error(libc::EPROTOTYPE)),
+            UnixSocketError::WrongType
+        );
+        assert_eq!(
+            classify_unix_connect_error(Error::from_raw_os_error(libc::ENOTSOCK)),
+            UnixSocketError::NotSocket
+        );
+        assert_eq!(
+            classify_unix_connect_error(Error::from(ErrorKind::NotFound)),
+            UnixSocketError::NotFound
+        );
+        assert_eq!(
+            classify_unix_connect_error(Error::from(ErrorKind::PermissionDenied)),
+            UnixSocketError::PermissionDenied
+        );
+        assert_eq!(
+            classify_unix_connect_error(Error::from(ErrorKind::TimedOut)),
+            UnixSocketError::TimedOut
+        );
+        assert_eq!(
+            classify_unix_connect_error(Error::from(ErrorKind::WouldBlock)),
+            UnixSocketError::TimedOut
+        );
+        assert!(matches!(
+            classify_unix_connect_error(Error::from(ErrorKind::InvalidInput)),
+            UnixSocketError::Other(_)
+        ));
     }
 
     #[test]

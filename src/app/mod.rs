@@ -7,12 +7,16 @@ mod activity_list;
 mod bindings;
 mod commands;
 mod compatibility;
+mod copy_mode;
 mod dialogs;
 mod directory;
 mod discover;
 mod downloads;
 mod downloads_view;
 mod find;
+mod floating;
+mod floating_drag;
+mod focus_history;
 mod font_page;
 mod font_picker;
 mod font_size;
@@ -27,6 +31,7 @@ mod notify;
 mod server_page;
 mod sounds;
 pub use notify::notify_restart_failure;
+mod host_key;
 mod pair_device;
 mod pane_header;
 mod pane_moves;
@@ -35,7 +40,9 @@ mod panel;
 mod panes;
 pub(crate) mod platform;
 mod popups;
+mod ports;
 mod program_icons;
+mod prompts;
 mod recorder;
 mod remote;
 mod select_copy;
@@ -43,10 +50,13 @@ mod settings_kit;
 mod settings_nav;
 mod settings_shell;
 mod settings_view;
+mod shared_hosts;
 mod shortcuts_page;
 mod sidebar;
 mod splits;
 mod sprites;
+mod ssh_agent;
+mod ssh_install;
 mod ssh_setup;
 mod stats;
 mod tab_icons;
@@ -165,6 +175,9 @@ pub(crate) fn view(s: &Workspace, cx: &mut Cx<Workspace>) -> El {
             };
             Some(pair_device::dialog(s, d, viewport, cx.env().scale * scale))
         }
+        Some(panel) if matches!(panel.kind, panel::PanelKind::Prompt(_)) => {
+            Some(prompts::dialog(s, viewport))
+        }
         Some(_) => dialogs::dialog(s, viewport),
         None => None,
     };
@@ -173,7 +186,7 @@ pub(crate) fn view(s: &Workspace, cx: &mut Cx<Workspace>) -> El {
         .key("window")
         .pointer_buttons([rune::PointerButton::Back, rune::PointerButton::Forward])
         .on_press_tx(|s: &mut Workspace, tx: &mut Tx| {
-            if s.panel.is_some() || s.drag.is_some() {
+            if s.panel.is_some() || s.drag.is_some() || s.layer_drag.is_some() {
                 return;
             }
             let action = match tx.button() {
@@ -235,13 +248,20 @@ fn poll(s: &mut Workspace, _: f64, tx: &mut Tx) -> bool {
     if let Some(delay) = next_server {
         tx.wake_after(delay);
     }
-    let remote_changed = s.poll_remote_navigation(now);
+    let remote_changed = s.poll_remote_navigation(now) | s.poll_remote_mutes(now);
+    if let Some(delay) = s.next_remote_mute_deadline(now) {
+        tx.wake_after(delay);
+    }
     let updates_changed = s.poll_updates(now, tx);
     let settings_changed = s.poll_settings(now, tx);
+    let prompts_changed = s.poll_prompts(now, tx);
+    let focus_history_changed = s.poll_focus_history(now, tx);
     let mut changed = s.poll_navigation(now, tx)
         || remote_changed
         || updates_changed
         || settings_changed
+        || prompts_changed
+        || focus_history_changed
         || activity_changed
         || server_changed;
     if let Some(panel) = &mut s.panel
@@ -306,6 +326,8 @@ fn poll(s: &mut Workspace, _: f64, tx: &mut Tx) -> bool {
 
 #[cfg(test)]
 mod physical_input_tests;
+#[cfg(test)]
+mod present_mode_tests;
 #[cfg(test)]
 pub(crate) mod scratch;
 #[cfg(test)]

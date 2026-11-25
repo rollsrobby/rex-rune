@@ -1,7 +1,12 @@
 //! A one-shot, explicitly authorized native Rex SSH auto-start. Never used by attachment.
 use super::{Target, last_line};
 use anyhow::{Context, Result, ensure};
-use std::{ffi::OsStr, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 /// Whether the one-shot command could already have started a server.
 #[derive(Debug)]
@@ -125,7 +130,7 @@ pub fn command_preview(target: &Target) -> Result<String> {
     ))
 }
 
-fn quote_arg(arg: &str) -> String {
+pub fn quote_arg(arg: &str) -> String {
     if arg == "{}"
         || (!arg.is_empty()
             && arg
@@ -138,20 +143,27 @@ fn quote_arg(arg: &str) -> String {
     }
 }
 
-fn local_rex() -> PathBuf {
+pub(super) fn local_rex() -> PathBuf {
     crate::platform::tools::program("rex")
 }
 
-async fn output(program: &OsStr, args: &[String]) -> Result<String> {
-    output_with_timeout(program, args, Duration::from_secs(45)).await
+pub(super) async fn output(
+    program: &OsStr,
+    args: &[String],
+    agent: Option<&Path>,
+) -> Result<String> {
+    output_with_timeout(program, args, Duration::from_secs(45), agent).await
 }
 
 async fn output_with_timeout(
     program: &OsStr,
     args: &[String],
     timeout: Duration,
+    agent: Option<&Path>,
 ) -> Result<String> {
-    let output = tokio::time::timeout(timeout, tokio::process::Command::new(program)
+    let mut cmd = tokio::process::Command::new(program);
+    super::apply_agent_tokio(&mut cmd, agent);
+    let output = tokio::time::timeout(timeout, cmd
         .args(args).stdin(Stdio::null()).kill_on_drop(true).output()).await
         .context("Command timed out")?
         .with_context(|| format!("Couldn't run {}. Install Rex preview.14 or newer locally and on the SSH host, then try again", program.to_string_lossy()))?;
@@ -164,7 +176,7 @@ async fn output_with_timeout(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn require_api12(version: &str, location: &str) -> Result<()> {
+pub(super) fn require_api12(version: &str, location: &str) -> Result<()> {
     // Local Rex can pretty-print JSON; SSH login banners may precede a compact reply.
     let value: serde_json::Value = serde_json::from_str(version)
         .or_else(|_| {
@@ -189,15 +201,21 @@ fn require_api12(version: &str, location: &str) -> Result<()> {
 
 /// Call only after the person confirms. Every invocation authorizes one attempt, never a
 /// persistent auto-start setting. SSH config/aliases remain OpenSSH's responsibility.
-pub async fn start_personal(endpoint: &str) -> Result<Attachment, Failure> {
+pub async fn start_personal(endpoint: &str, agent: Option<&Path>) -> Result<Attachment, Failure> {
     crate::platform::local::require_ssh()?;
     let target = Target::parse(endpoint)?.context("Setup requires an ssh:// host")?;
-    start_with(&target, local_rex().as_os_str(), OsStr::new("ssh")).await
+    super::hostkey::require_safe_config(&target, agent).await?;
+    start_with(&target, local_rex().as_os_str(), OsStr::new("ssh"), agent).await
 }
 
-async fn start_with(target: &Target, rex: &OsStr, ssh: &OsStr) -> Result<Attachment, Failure> {
+async fn start_with(
+    target: &Target,
+    rex: &OsStr,
+    ssh: &OsStr,
+    agent: Option<&Path>,
+) -> Result<Attachment, Failure> {
     let args = start_args(target)?;
-    let local = output(rex, &["version".into(), "--json".into()]).await?;
+    let local = output(rex, &["version".into(), "--json".into()], None).await?;
     require_api12(&local, "Local")?;
     let mut remote = target.options();
     remote.extend([
@@ -205,9 +223,9 @@ async fn start_with(target: &Target, rex: &OsStr, ssh: &OsStr) -> Result<Attachm
         target.destination(),
         "rex version --json".into(),
     ]);
-    let version = output(ssh, &remote).await.context("Couldn't check remote Rex. Install preview.14 or newer there, or check the SSH login; nothing was started")?;
+    let version = output(ssh, &remote, agent).await.context("Couldn't check remote Rex. Install preview.14 or newer there, or check the SSH login; nothing was started")?;
     require_api12(&version, "Remote")?;
-    start_after_preflight(target, rex, &args, Duration::from_secs(45)).await
+    start_after_preflight(target, rex, &args, Duration::from_secs(45), agent).await
 }
 
 async fn start_after_preflight(
@@ -215,8 +233,9 @@ async fn start_after_preflight(
     rex: &OsStr,
     args: &[String],
     timeout: Duration,
+    agent: Option<&Path>,
 ) -> Result<Attachment, Failure> {
-    let reply = output_with_timeout(rex, args, timeout)
+    let reply = output_with_timeout(rex, args, timeout, agent)
         .await
         .map_err(|error| Failure::after_start(format!("{error:#}")))?;
     let status: rexrs::api::server::StatusResponse =
@@ -232,8 +251,8 @@ mod tests {
     #[tokio::test]
     async fn old_missing_and_refusing_rex_never_start_or_retry() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("rex-setup-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
         let rex = root.join("rex");
         let ssh = root.join("ssh");
         let log = root.join("attempts");
@@ -256,14 +275,14 @@ mod tests {
         ] {
             script(&ssh, remote);
             assert!(
-                start_with(&target, rex.as_os_str(), ssh.as_os_str())
+                start_with(&target, rex.as_os_str(), ssh.as_os_str(), None)
                     .await
                     .is_err()
             );
             assert!(!log.exists(), "preflight failed, no native auto-start");
         }
         script(&ssh, "echo '{\"api_revision\":12}'");
-        let error = start_with(&target, rex.as_os_str(), ssh.as_os_str())
+        let error = start_with(&target, rex.as_os_str(), ssh.as_os_str(), None)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("remote refused to start"));
@@ -275,19 +294,78 @@ mod tests {
         std::fs::remove_file(&log).unwrap();
         script(&rex, "echo '{\"api_revision\":11}'");
         assert!(
-            start_with(&target, rex.as_os_str(), ssh.as_os_str())
+            start_with(&target, rex.as_os_str(), ssh.as_os_str(), None)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("Local Rex is too old")
         );
         assert!(
-            start_with(&target, root.join("missing").as_os_str(), ssh.as_os_str())
-                .await
-                .is_err()
+            start_with(
+                &target,
+                root.join("missing").as_os_str(),
+                ssh.as_os_str(),
+                None,
+            )
+            .await
+            .is_err()
         );
         assert!(!log.exists());
-        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_with_propagates_ssh_auth_sock_to_ssh_and_rex() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        let rex = root.join("rex");
+        let ssh = root.join("ssh");
+        let ssh_env = root.join("ssh.env");
+        let rex_env = root.join("rex.env");
+        let script = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        let status_json = serde_json::to_string(&rexrs::api::server::StatusResponse {
+            listeners: vec![rexrs::api::server::Listener {
+                endpoint: "unix:///run/rex/server.sock".into(),
+                addresses: vec!["/run/rex/server.sock".into()],
+                transport: "unix".into(),
+                primary: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        script(
+            &rex,
+            &format!(
+                "if [ \"$1\" = version ]; then echo '{{\"api_revision\":12}}'; exit 0; fi\nprintf '%s' \"${{SSH_AUTH_SOCK-UNSET}}\" > '{}'\nprintf '%s\\n' '{}'",
+                rex_env.display(),
+                status_json
+            ),
+        );
+        script(
+            &ssh,
+            &format!(
+                "printf '%s' \"${{SSH_AUTH_SOCK-UNSET}}\" > '{}'\necho '{{\"api_revision\":12}}'",
+                ssh_env.display()
+            ),
+        );
+        let agent = root.join("chosen-agent.sock");
+        let target = Target::parse("ssh://work-alias").unwrap().unwrap();
+        let outcome = start_with(&target, rex.as_os_str(), ssh.as_os_str(), Some(&agent))
+            .await
+            .unwrap();
+        assert_eq!(outcome, Attachment::Automatic);
+        assert_eq!(
+            std::fs::read_to_string(&ssh_env).unwrap(),
+            agent.to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rex_env).unwrap(),
+            agent.to_str().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -304,6 +382,7 @@ mod tests {
                 OsStr::new("/bin/sh"),
                 &args,
                 Duration::from_millis(100),
+                None,
             )
             .await
             .unwrap_err();
@@ -318,6 +397,7 @@ mod tests {
             OsStr::new("/nonexistent/rex"),
             &[],
             Duration::from_millis(100),
+            None,
         )
         .await
         .unwrap_err();

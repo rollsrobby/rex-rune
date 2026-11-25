@@ -83,6 +83,7 @@ fn dispatch(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, global_only: bool) ->
     let in_mode = !s.bindings.modes.is_empty();
     s.bindings.mode_map = in_mode.then(|| super::bindings::mode_map(map, &s.bindings.modes, modes));
     let map = s.bindings.mode_map.as_ref().unwrap_or(map);
+    let in_copy = s.in_copy_mode();
     let searching = s.panel.is_none() && s.active_terminal().is_some_and(|t| t.search.is_some());
     let step = s.bindings.sequence.advance(map, input, |i| {
         let binding = &map.bindings[i].binding;
@@ -107,7 +108,7 @@ fn dispatch(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, global_only: bool) ->
                     || searching && matches!(spec.name, "client.find.next" | "client.find.previous")
             }
             actions::Kind::Forward | actions::Kind::Server { .. } => {
-                !global_only && model.connected
+                !global_only && !in_copy && model.connected
             }
             actions::Kind::Skip => false,
         }
@@ -149,6 +150,10 @@ fn dispatch(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, global_only: bool) ->
             }
             match actions::classify(&binding, server_actions) {
                 actions::Kind::Local(spec) => {
+                    if s.in_copy_mode() && spec.blocked_in_copy_mode() {
+                        s.bindings.consumed.insert(identity, true);
+                        return true;
+                    }
                     s.bindings
                         .consumed
                         .insert(identity, sequence || once || !spec.repeats());
@@ -160,6 +165,7 @@ fn dispatch(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, global_only: bool) ->
                     )
                 }
                 actions::Kind::Forward => {
+                    s.clear_focus_history_walk();
                     if sequence || once {
                         // Suppress held-tail repeats after completing the sequence.
                         // forward() still records the press in forwarded, so its release
@@ -170,6 +176,7 @@ fn dispatch(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, global_only: bool) ->
                     forward(s, ev, tx, prefix)
                 }
                 actions::Kind::Server { repeats } => {
+                    s.clear_focus_history_walk();
                     s.bindings
                         .consumed
                         .insert(identity, sequence || once || !repeats);
@@ -207,6 +214,7 @@ pub fn list_key(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
             s.navigate_panel(if ev.key == Key::Up { -1 } else { 1 });
             tx.instant();
         }
+        Key::Enter if ctrl(ev) && s.ports_target().is_some() => s.submit_port(true, tx),
         // Commands: the highlighted command's shortcut, in Settings.
         Key::Enter
             if ctrl(ev)
@@ -251,7 +259,7 @@ pub fn list_key(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
             && space(ev, tx)
             && s.panel
                 .as_ref()
-                .is_some_and(|p| matches!(p.kind, PanelKind::Pane)) =>
+                .is_some_and(|p| matches!(p.kind, PanelKind::Pane | PanelKind::Layer)) =>
         {
             s.close_panel(tx)
         }
@@ -263,14 +271,39 @@ pub fn list_key(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
 /// Keys a terminal's search field takes: Enter selects the next older match and Shift+Enter
 /// the next newer one; Escape closes the search.
 pub fn search_key(s: &mut Workspace, key: &(HostId, String), ev: &KeyEvent, tx: &mut Tx) -> bool {
+    s.clear_focus_history_walk();
     s.last_keypress = Some(std::time::Instant::now());
     if global_key(s, ev, tx) {
         return true;
     }
     match ev.key {
-        Key::Escape => s.close_search(key, tx),
+        Key::Escape => {
+            if s.copy_mode_on(key) {
+                let identity = Input {
+                    event: ev,
+                    code: tx.physical_key(),
+                    base: tx.key_base(),
+                    repeat: false,
+                }
+                .identity();
+                s.bindings.consumed.insert(identity, true);
+                s.cancel_copy_mode_search(key, tx);
+            } else {
+                s.close_search(key, tx);
+            }
+        }
         Key::Enter => {
-            if let Some(term) = s.terminals.get_mut(key) {
+            if s.copy_mode_on(key) {
+                let identity = Input {
+                    event: ev,
+                    code: tx.physical_key(),
+                    base: tx.key_base(),
+                    repeat: false,
+                }
+                .identity();
+                s.bindings.consumed.insert(identity, true);
+                s.confirm_copy_mode_search(key, tx);
+            } else if let Some(term) = s.terminals.get_mut(key) {
                 term.send(Command::SearchStep(!ev.mods.shift));
             }
         }
@@ -294,9 +327,23 @@ pub fn on_key(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if s.recording().is_some() {
         return super::recorder::key(s, ev, tx);
     }
+    if ev.key == Key::Escape && s.layer_drag.is_some() {
+        s.cancel_layer_drag();
+        return true;
+    }
     use super::platform::keys::{WindowMenuKey, window_menu_key};
     let window_key = window_menu_key(&ev.key, ev.mods);
     if let Some(panel) = &s.panel {
+        if matches!(panel.kind, PanelKind::Prompt(_)) {
+            return s.prompt_key(ev, tx);
+        }
+        if matches!(panel.kind, PanelKind::InstallSsh { .. })
+            && ev.key == Key::Enter
+            && ev.mods == rune::Mods::default()
+        {
+            s.install_enter(tx);
+            return true;
+        }
         // The system's Close would fall through to the window and quit Rex: with a popup
         // or Settings open, Command+W closes that instead.
         if window_key == Some(WindowMenuKey::Close) {
@@ -325,22 +372,42 @@ pub fn on_key(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if window_key.is_some() {
         return false;
     }
+    if s.in_copy_mode() {
+        return s.copy_mode_key(ev, tx);
+    }
     forward(s, ev, tx, Vec::new())
 }
 
 fn forward(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, prefix: Vec<String>) -> bool {
+    let code = tx.physical_key();
+    let repeat = tx.key_repeat();
+    let base = tx.key_base();
+    let identity = Input {
+        event: ev,
+        code,
+        base,
+        repeat: false,
+    }
+    .identity();
+    // A repeat reaches the PTY only when its press did: a key held across an automatic
+    // copy-mode exit (or popup/dialog close) must never leak repeats to the PTY.
+    if repeat && !s.forwarded.contains(&identity) {
+        return true;
+    }
     if tx.focused().is_some() {
         // Both unbound keys and explicit forward bindings return focus to the terminal.
         tx.blur();
     }
-    let code = tx.physical_key();
-    let action = if tx.key_repeat() {
+    let action = if repeat {
         Action::Repeat
     } else {
         Action::Press
     };
-    let base = tx.key_base();
     let composes = s.option_composes(tx.alt_keys());
+    let payload = keys::payload(ev, code, base, action);
+    if payload.is_some() {
+        s.clear_focus_history_walk();
+    }
     let Some(term) = s.active_terminal_mut() else {
         return true;
     };
@@ -348,7 +415,7 @@ fn forward(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, prefix: Vec<String>) -
         return true;
     }
     term.clear_selection();
-    if let Some(mut payload) = keys::payload(ev, code, base, action) {
+    if let Some(mut payload) = payload {
         if composes {
             keys::option_composed(&mut payload, ev);
         }
@@ -361,15 +428,7 @@ fn forward(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, prefix: Vec<String>) -
             }
         });
         s.last_keypress = Some(std::time::Instant::now());
-        s.forwarded.insert(
-            Input {
-                event: ev,
-                code,
-                base,
-                repeat: false,
-            }
-            .identity(),
-        );
+        s.forwarded.insert(identity);
     }
     true
 }
@@ -387,8 +446,12 @@ pub fn on_key_up(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     .identity();
     let consumed = s.bindings.consumed.remove(&identity).is_some();
+    if s.is_prompt_open() || s.ports_target().is_some() {
+        s.forwarded.remove(&identity);
+        return true;
+    }
     if !s.forwarded.remove(&identity) {
-        return consumed || s.panel.is_none();
+        return consumed || s.in_copy_mode() || s.panel.is_none();
     }
     let composes = s.option_composes(tx.alt_keys());
     if let Some(term) = s.active_terminal_mut()
@@ -410,19 +473,32 @@ pub fn on_ime(s: &mut Workspace, ime: &Ime, _: &mut Tx) -> bool {
         // composition cancelled by the recorder) must never become terminal paste.
         return true;
     }
+    if s.in_copy_mode() {
+        if let Some(term) = s.active_terminal_mut() {
+            term.preedit.clear();
+        }
+        return true;
+    }
     let Some(term) = s.active_terminal_mut() else {
         return false;
     };
     match ime {
-        Ime::Preedit(text, _) => term.preedit = text.clone(),
+        Ime::Preedit(text, _) => {
+            term.preedit = text.clone();
+            if !text.is_empty() {
+                s.clear_focus_history_walk();
+            }
+        }
         Ime::Commit(text) => {
             term.preedit.clear();
             if term.status().live && !text.is_empty() {
                 term.send(Command::Paste(text.clone()));
+                s.clear_focus_history_walk();
                 s.last_keypress = Some(std::time::Instant::now());
             }
         }
-        _ => {}
+        Ime::Disabled => term.preedit.clear(),
+        Ime::Enabled => {}
     }
     true
 }

@@ -44,7 +44,8 @@ impl Workspace {
         let narrow = width < super::downloads_view::CHIP_FULL_WIDTH;
         if narrow
             && (self.bindings.sequence.depth > 0
-                || self.key_mode().is_some()
+                || self.has_mode_chip()
+                || self.has_waiting_prompt()
                 || super::downloads_view::chip_label(self).is_some())
         {
             return None;

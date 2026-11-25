@@ -8,7 +8,7 @@ use super::{
 };
 use rex_rune::settings::NoticePosition;
 use rune::{Cursor, El, Tx, col, el, row, text};
-use rune_kit::TextField;
+use rune_kit::{Switch, TextField};
 
 fn modal(s: &Workspace, viewport: [f32; 2], body: El) -> El {
     let panel = col()
@@ -22,7 +22,13 @@ fn modal(s: &Workspace, viewport: [f32; 2], body: El) -> El {
 
 /// A centered dialog surface over a dark scrim; `surface` sets its own size and padding.
 pub fn modal_frame(s: &Workspace, surface: El) -> El {
-    modal_layer(s, surface, false, 0.)
+    modal_layer_with(s, surface, false, 0., true)
+}
+
+/// Like [`modal_frame`], but clicking the dark scrim outside the dialog does nothing.
+/// Used for `rex.ui` prompts where cancelling ends the prompt on every connected client.
+pub fn modal_frame_persistent(s: &Workspace, surface: El) -> El {
+    modal_layer_with(s, surface, false, 0., false)
 }
 
 /// [`modal_frame`], or with `under` the same layer and dialog drawn but inert, for a list
@@ -31,6 +37,10 @@ pub fn modal_frame(s: &Workspace, surface: El) -> El {
 /// that far below the window's top edge: it is centred in what is left, under the scrim,
 /// which still covers the whole window.
 pub fn modal_layer(s: &Workspace, surface: El, under: bool, top: f32) -> El {
+    modal_layer_with(s, surface, under, top, true)
+}
+
+fn modal_layer_with(s: &Workspace, surface: El, under: bool, top: f32, scrim_dismiss: bool) -> El {
     // Padding, dividers and disabled controls must not pass a press to the dismiss scrim.
     // Children still handle their own input; empty space leaves the keyboard focus alone.
     let name = s
@@ -54,14 +64,20 @@ pub fn modal_layer(s: &Workspace, surface: El, under: bool, top: f32) -> El {
     if !under {
         layer = layer.modal(false, |s: &mut Workspace| s.cancel_panel_quiet());
     }
-    let mut layer = layer.child(
-        el().key("scrim")
-            .pin(Some(0.), Some(0.), Some(0.), Some(0.))
-            // No blur: it would hide the pane a confirmation names, and re-blur every
-            // frame while terminals stream behind it.
-            .fill(black(0.5))
-            .on_press_tx(|s: &mut Workspace, tx: &mut Tx| s.cancel_panel(tx)),
-    );
+    let mut scrim = el()
+        .key("scrim")
+        .pin(Some(0.), Some(0.), Some(0.), Some(0.))
+        // No blur: it would hide the pane a confirmation names, and re-blur every
+        // frame while terminals stream behind it.
+        .fill(black(0.5));
+    scrim = if scrim_dismiss {
+        scrim.on_press_tx(|s: &mut Workspace, tx: &mut Tx| s.cancel_panel(tx))
+    } else {
+        scrim
+            .preserve_focus_on_press(true)
+            .on_press(|_: &mut Workspace| {})
+    };
+    let mut layer = layer.child(scrim);
     if let Some(outline) = target_outline(s) {
         layer = layer.child(outline);
     }
@@ -92,16 +108,17 @@ fn form(s: &Workspace, form: &Form) -> El {
             text(error.clone())
                 .font(ui(13.))
                 .color(rgb(danger()))
+                .wrap()
                 .key("form-error"),
         );
     }
-    if let Form::EditHost(_) = form {
-        body = body.child(
-            text("A new endpoint connects to a different server; sessions on the old one keep running. The shell applies to new sessions, tabs and splits.")
-                .font(ui(12.))
-                .color(rgb(muted()))
-                .wrap(),
-        );
+    if let Form::EditHost(host) = form {
+        let note = if s.is_shared_managed(*host) {
+            "Name and endpoint changes update Rex's shared host list. A new endpoint connects to a different server; sessions on the old one keep running. The default shell stays on this client."
+        } else {
+            "A new endpoint connects to a different server; sessions on the old one keep running. The shell applies to new sessions, tabs and splits."
+        };
+        body = body.child(text(note).font(ui(12.)).color(rgb(muted())).wrap());
     }
     if let Form::AddSsh(index) = form {
         body = body.child(
@@ -122,6 +139,34 @@ fn form(s: &Workspace, form: &Form) -> El {
         );
     }
     if let Form::AddHost = form {
+        if s.can_save_shared_host() || panel.save_shared {
+            body = body.child(
+                row()
+                    .key("save-shared-host-row")
+                    .w_full()
+                    .center_y()
+                    .gap(12.)
+                    .child(
+                        text("Save to shared Rex host list")
+                            .font(ui(13.))
+                            .color(rgb(ink()))
+                            .grow(1.),
+                    )
+                    .child(
+                        Switch::new(panel.save_shared)
+                            .label("Save to shared Rex host list")
+                            .hide_label()
+                            .on_toggle(|s: &mut Workspace| {
+                                if let Some(panel) = &mut s.panel {
+                                    panel.save_shared = !panel.save_shared;
+                                    panel.error = None;
+                                }
+                            })
+                            .build(k)
+                            .key("save-shared-host"),
+                    ),
+            );
+        }
         body = body.child(
             text("https:// reaches a Rex server over the network (a bare host name is tried on port 443, then 7297); ssh://user@host[/socket] forwards a server's socket over SSH; unix:// is a socket on this machine.")
                 .font(ui(12.))
@@ -140,6 +185,14 @@ fn form(s: &Workspace, form: &Form) -> El {
     if let Form::DownloadFolder = form {
         body = body.child(
             text("Where Download file… saves. Empty uses the system's Downloads folder. The folder must exist; nothing is overwritten.")
+                .font(ui(12.))
+                .color(rgb(muted()))
+                .wrap(),
+        );
+    }
+    if let Form::SshAgentSocket = form {
+        body = body.child(
+            text("Path to a Unix SSH agent socket (/… or ~/…). Saved even if the agent is not running yet; IdentityAgent in ~/.ssh/config still chooses the agent for hosts it names.")
                 .font(ui(12.))
                 .color(rgb(muted()))
                 .wrap(),
@@ -195,43 +248,67 @@ fn form(s: &Workspace, form: &Form) -> El {
     )
 }
 
-fn confirm(panel_title: &str, description: &str) -> El {
-    confirm_with(
+fn confirm(panel_title: &str, description: &str, blocked: Option<&str>) -> El {
+    confirmation(
         panel_title,
         description,
         "Keep running",
         "Close and end programs",
+        blocked,
     )
 }
 
 fn confirm_with(panel_title: &str, description: &str, keep: &str, danger: &str) -> El {
-    col()
-        .gap(12.)
-        .child(title(panel_title))
-        .child(
-            text(description.to_owned())
+    confirmation(panel_title, description, keep, danger, None)
+}
+
+fn confirmation(
+    panel_title: &str,
+    description: &str,
+    keep: &str,
+    danger: &str,
+    blocked: Option<&str>,
+) -> El {
+    let body = col().gap(12.).child(title(panel_title)).child(
+        text(description.to_owned())
+            .font(ui(13.))
+            .color(rgb(muted()))
+            .wrap(),
+    );
+    let body = if let Some(reason) = blocked {
+        body.child(
+            text(reason.to_owned())
                 .font(ui(13.))
                 .color(rgb(muted()))
                 .wrap(),
         )
-        .child(
-            row()
-                .gap(8.)
-                .justify_end()
-                .child(
-                    pill("cancel-close", keep, Pill::Neutral, 32., |s, tx| {
-                        s.cancel_panel(tx)
-                    })
-                    .default_button()
-                    .tab_index(1),
-                )
-                .child(
-                    pill("confirm-close", danger, Pill::Danger, 32., |s, tx| {
-                        s.submit(tx)
-                    })
-                    .tab_index(2),
-                ),
-        )
+    } else {
+        body
+    };
+    let disabled = blocked.is_some();
+    let close = pill("confirm-close", danger, Pill::Danger, 32., move |s, tx| {
+        if !disabled {
+            s.submit(tx);
+        }
+    })
+    .tab_index(2);
+    body.child(
+        row()
+            .gap(8.)
+            .justify_end()
+            .child(
+                pill("cancel-close", keep, Pill::Neutral, 32., |s, tx| {
+                    s.cancel_panel(tx)
+                })
+                .default_button()
+                .tab_index(1),
+            )
+            .child(if disabled {
+                close.disabled(true).opacity(0.5)
+            } else {
+                close
+            }),
+    )
 }
 
 pub fn dialog(s: &Workspace, viewport: [f32; 2]) -> Option<El> {
@@ -245,18 +322,33 @@ pub fn dialog(s: &Workspace, viewport: [f32; 2]) -> Option<El> {
         } if method == "server.stop" => {
             confirm_with(&panel.title, description, "Cancel", "Stop server")
         }
-        PanelKind::Confirm { description, .. } => confirm(&panel.title, description),
+        PanelKind::Confirm { description, .. } => confirm(
+            &panel.title,
+            description,
+            panel.layer.as_ref().and(panel.error.as_deref()),
+        ),
         PanelKind::Settings => return Some(super::settings_view::settings(s, viewport)),
         PanelKind::RemoveHost(host) => {
             let label = &s.settings.hosts[*host].label;
-            confirm_with(
-                &panel.title,
-                &format!(
-                    "Rex Rune stops connecting to {label} and forgets it. Its sessions and programs keep running on that server, and you can add it again later."
-                ),
-                "Keep host",
-                "Remove host",
-            )
+            if s.is_shared_managed(*host) {
+                confirm_with(
+                    &panel.title,
+                    &format!(
+                        "Removes {label} from Rex's shared host list for every client connected to this server. Its sessions and programs keep running on that server, and you can add it again later."
+                    ),
+                    "Keep host",
+                    "Remove from shared list",
+                )
+            } else {
+                confirm_with(
+                    &panel.title,
+                    &format!(
+                        "Rex Rune stops connecting to {label} and forgets it. Its sessions and programs keep running on that server, and you can add it again later."
+                    ),
+                    "Keep host",
+                    "Remove host",
+                )
+            }
         }
         PanelKind::ResetShortcuts => confirm_with(
             &panel.title,
@@ -265,6 +357,8 @@ pub fn dialog(s: &Workspace, viewport: [f32; 2]) -> Option<El> {
             "Reset all",
         ),
         PanelKind::StartSsh { endpoint } => super::ssh_setup::dialog(s, endpoint),
+        PanelKind::InstallSsh { endpoint } => super::ssh_install::dialog(s, endpoint),
+        PanelKind::HostKey { endpoint } => super::host_key::dialog(s, endpoint),
         PanelKind::Download(d) => super::downloads_view::dialog(s, d),
         PanelKind::AgentChange { change, steps } => {
             super::integrations::confirm(s, &panel.title, change, steps)

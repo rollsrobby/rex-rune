@@ -9,7 +9,9 @@ use super::{
     widgets::ScrollFx,
 };
 use rex_rune::{
-    connection::{Command, DEFAULT_TAB_LABEL, HostCommand, HostConnection, HostModel, Options},
+    connection::{
+        Command, DEFAULT_TAB_LABEL, HostCommand, HostConnection, HostModel, HumanClose, Options,
+    },
     layout::{Divider, shell_layout},
     settings::{
         ChromeTheme, Host, NoticePosition, Settings, TerminalThemeChoice, terminal::OptionSides,
@@ -70,19 +72,25 @@ pub struct Workspace {
     pub active: usize,
     pub terminals: HashMap<(HostId, String), Term>,
     pub panel: Option<Panel>,
+    pub(super) ports_watch: Option<super::ports::Watch>,
     pub notices: Vec<Notice>,
     next_notice: u64,
     zoom_notice: Option<u64>,
     pub drag: Option<DividerDrag>,
+    pub layer_drag: Option<super::floating_drag::LayerDrag>,
+    pub copy_mode: Option<super::copy_mode::Session>,
     /// Keys whose press went to a terminal; only their releases follow.
     pub forwarded: HashSet<super::bindings::Identity>,
     pub bindings: super::bindings::State,
     pub local_keymap: rex_rune::keymap::Resolved,
     pub keymap_generation: u64,
     pub navigation: super::navigation::History,
+    pub focus_history: super::focus_history::State,
     pub last_keypress: Option<std::time::Instant>,
     pub remote_off_notices: HashSet<HostId>,
     pub remote_navigation: Option<super::remote::Navigation>,
+    pub remote_mutes: Vec<super::remote::PendingMute>,
+    pub next_fetch_id: u64,
     /// Panes this window has taken size ownership of since it last came forward.
     pub claimed: HashSet<(HostId, String)>,
     pub handle: AppHandle<Workspace>,
@@ -178,7 +186,12 @@ pub struct Workspace {
     #[cfg(test)]
     pub notification_outbox: super::notify::Outbox,
     pub integrations: super::integrations::Integrations,
+    pub shared_hosts: super::shared_hosts::SharedHostsState,
+    pub ssh_agent: super::ssh_agent::SshAgentState,
     pub ssh_setup: super::ssh_setup::Setup,
+    pub(super) ssh_install: Option<super::ssh_install::Install>,
+    pub(super) install_serial: u64,
+    pub(super) host_key: super::host_key::Check,
     /// The tailnet's machines, for Add host.
     pub discovery: super::discover::Discovery,
     /// The terminal theme this client declares, from Settings; none is Follow server.
@@ -191,6 +204,8 @@ pub struct Workspace {
     pub restart: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     /// What this launch's downloads have told the person, and what finished rows may offer.
     pub downloads: super::downloads::Downloads,
+    /// Arrival-ordered `rex.ui` prompt queue and modal drafts (kept outside `Panel`).
+    pub prompts: super::prompts::PromptStore,
 }
 
 #[derive(Default)]
@@ -227,8 +242,10 @@ impl Workspace {
                 label: rex_rune::settings::endpoint_label(&options.endpoint),
                 endpoint: options.endpoint.clone(),
                 remote_control: false,
+                prompts: true,
                 collapsed: false,
                 shell: None,
+                shared: None,
             });
         }
         let wanted = if explicit {
@@ -273,18 +290,24 @@ impl Workspace {
             active,
             terminals: HashMap::new(),
             panel: None,
+            ports_watch: None,
             notices: Vec::new(),
             next_notice: 0,
             zoom_notice: None,
             drag: None,
+            layer_drag: None,
+            copy_mode: None,
             forwarded: HashSet::new(),
             bindings: Default::default(),
             local_keymap,
             keymap_generation: 0,
             navigation: Default::default(),
+            focus_history: Default::default(),
             last_keypress: None,
             remote_off_notices: HashSet::new(),
             remote_navigation: None,
+            remote_mutes: Vec::new(),
+            next_fetch_id: 0,
             claimed: HashSet::new(),
             handle,
             window_focused: true,
@@ -341,7 +364,12 @@ impl Workspace {
             #[cfg(test)]
             notification_outbox: Default::default(),
             integrations: Default::default(),
+            shared_hosts: Default::default(),
+            ssh_agent: Default::default(),
             ssh_setup: Default::default(),
+            ssh_install: None,
+            install_serial: 0,
+            host_key: Default::default(),
             discovery: Default::default(),
             term_theme,
             theme_dirs,
@@ -349,6 +377,7 @@ impl Workspace {
             updates: Default::default(),
             restart: Default::default(),
             downloads: Default::default(),
+            prompts: Default::default(),
         };
         this.init_updates();
         if let Some(error) = theme_error {
@@ -380,6 +409,9 @@ impl Workspace {
         if let Some(problem) = this.settings.shortcut_file.notice.take() {
             this.notify(problem);
         }
+        if this.unlink_orphaned_shared_hosts() {
+            this.save();
+        }
         for index in 0..this.settings.hosts.len() {
             this.connect_host(index, explicit);
         }
@@ -392,15 +424,16 @@ impl Workspace {
     }
 
     /// A connection to saved host `index` under a fresh id, with its wake thread.
-    fn spawn_host(&mut self, index: usize, explicit: bool) -> HostState {
+    pub(super) fn spawn_host(&mut self, index: usize, explicit: bool) -> HostState {
         let host = &self.settings.hosts[index];
+        let watch_shared = self.settings.sync_shared_hosts && self.is_shared_source(index);
         let cli = explicit && index == self.active;
         let preferred = if cli {
             self.options.session.clone()
         } else {
             self.settings.sessions.get(&host.endpoint).cloned()
         };
-        let connection = HostConnection::spawn_labeled(
+        let connection = HostConnection::spawn_with_prompts(
             host.endpoint.clone(),
             preferred,
             cli.then(|| self.options.new.clone())
@@ -410,12 +443,17 @@ impl Workspace {
             index == self.active,
             self.declared_theme(),
             self.settings.client_label(),
+            self.ssh_agent_socket(),
+            host.prompts,
         );
         let _ = connection
             .commands
             .send(HostCommand::Keymap(Box::new(self.keymap_declaration())));
         // About and the copied reports name the server; reading it changes nothing there.
         let _ = connection.commands.send(HostCommand::Identify);
+        if watch_shared {
+            let _ = connection.commands.send(HostCommand::WatchSharedHosts);
+        }
         let id = HostId(self.next_host);
         self.next_host += 1;
         let receiver = connection.wake.clone();
@@ -439,14 +477,23 @@ impl Workspace {
     }
 
     /// Forget a host's terminals and claims; dropping its `HostState` shuts its worker down.
-    fn forget_host(&mut self, state: HostState) {
+    pub(super) fn forget_host(&mut self, state: HostState) {
         let id = state.id;
+        if self.copy_mode.as_ref().is_some_and(|s| s.key.0 == id) {
+            self.copy_mode = None;
+        }
+        if self.focus_history.is_on_host(id) {
+            self.clear_focus_history_walk();
+        }
         self.terminals.retain(|(host, _), _| *host != id);
         self.claimed.retain(|(host, _)| *host != id);
         self.tab_states.retain(|(host, _), _| *host != id);
         self.unseen_done.retain(|(host, _)| *host != id);
         self.unseen_bells.retain(|(host, _)| *host != id);
         self.activity_epochs.remove(&id);
+        self.shared_hosts.last_reconciled.remove(&id);
+        self.shared_hosts.last_host_id.remove(&id);
+        self.forget_host_prompts(id);
     }
 
     /// Stop connecting to saved host `index` and drop it from the workspace. Its server, its
@@ -455,7 +502,22 @@ impl Workspace {
         if self.settings.hosts.len() <= 1 || index >= self.hosts.len() {
             return;
         }
+        if self.is_shared_managed(index) {
+            let reason = self.shared_write_blocked(index).unwrap_or_else(|| {
+                "Confirm removal to remove it from Rex's shared host list".into()
+            });
+            self.inform(format!(
+                "{} cannot be removed directly: {reason}.",
+                self.settings.hosts[index].label
+            ));
+            return;
+        }
+        self.leave_install_dialog();
+        self.clear_focus_history_walk();
         self.navigation.cancel();
+        if self.ports_target().is_some() {
+            self.close_panel(tx);
+        }
         let state = self.hosts.remove(index);
         self.forget_host(state);
         let host = self.settings.hosts.remove(index);
@@ -464,11 +526,13 @@ impl Workspace {
         // Menus and drags name hosts by position, which just shifted.
         self.panel = None;
         self.drag = None;
+        self.layer_drag = None;
         if self.active == index {
             self.active = 0;
         } else if self.active > index {
             self.active -= 1;
         }
+        self.unlink_orphaned_shared_hosts();
         self.update_visibility();
         self.save();
         self.update_title(tx);
@@ -487,6 +551,26 @@ impl Workspace {
         endpoint: String,
         shell: Option<String>,
     ) {
+        if index >= self.settings.hosts.len() {
+            return;
+        }
+        if self.is_shared_managed(index)
+            && (self.settings.hosts[index].label != label
+                || self.settings.hosts[index].endpoint != endpoint)
+        {
+            let reason = self.shared_write_blocked(index).unwrap_or_else(|| {
+                "Shared host edits must go through Edit host to update Rex's shared host list"
+                    .into()
+            });
+            self.inform(format!(
+                "{} cannot be edited directly: {reason}.",
+                self.settings.hosts[index].label
+            ));
+            return;
+        }
+        if self.settings.hosts[index].endpoint != endpoint {
+            self.stop_install_for_host(index);
+        }
         let host = &mut self.settings.hosts[index];
         host.label = label;
         host.shell = shell;
@@ -496,11 +580,14 @@ impl Workspace {
             self.settings.sessions.remove(&old);
             // An endpoint edit means another machine, not a history migration.
             self.settings.recent_paths.remove(&old);
+            self.unlink_orphaned_shared_hosts();
             let state = self.spawn_host(index, false);
             let old = std::mem::replace(&mut self.hosts[index], state);
             self.forget_host(old);
             if self.active == index {
+                self.clear_focus_history_walk();
                 self.drag = None;
+                self.layer_drag = None;
             }
             self.update_visibility();
         }
@@ -527,7 +614,17 @@ impl Workspace {
         let activity_selection = self.activity_selection();
         let id = self.hosts[index].id;
         let old_session = self.hosts[index].model.selected.clone();
-        let (mut model, notices, clipboard, bells, client_actions, performs) = {
+        let (
+            mut model,
+            notices,
+            clipboard,
+            bells,
+            client_actions,
+            performs,
+            prompt_events,
+            shared_writes,
+            view_fetches,
+        ) = {
             let mut shared = self.hosts[index]
                 .connection
                 .model
@@ -538,18 +635,38 @@ impl Workspace {
             let bells = std::mem::take(&mut shared.bells);
             let client_actions = std::mem::take(&mut shared.client_actions);
             let performs = std::mem::take(&mut shared.performs);
+            // Bootstrap can publish current-epoch prompt events before `connected` flips to
+            // `true`; keep them buffered until connected so an intervening wake cannot drop them.
+            let prompt_events = if shared.connected {
+                std::mem::take(&mut shared.prompt_events)
+            } else {
+                let epoch = shared.connection_epoch;
+                shared.prompt_events.retain(|e| e.epoch == epoch);
+                std::collections::VecDeque::new()
+            };
+            let shared_writes = std::mem::take(&mut shared.shared_writes);
+            let view_fetches = std::mem::take(&mut shared.view_fetches);
+            let mut cloned = shared.clone();
+            cloned.prompt_events.clear();
             (
-                shared.clone(),
+                cloned,
                 notices,
                 clipboard,
                 bells,
                 client_actions,
                 performs,
+                prompt_events,
+                shared_writes,
+                view_fetches,
             )
         };
+        model.view_fetches = view_fetches;
         for (block, connection) in &model.terminals {
             let key = (id, block.clone());
-            if !self.terminals.contains_key(&key) {
+            // An undo can restore the same ID before the UI sees the intervening removal.
+            if self.terminals.get(&key).is_none_or(|term| {
+                !std::sync::Arc::ptr_eq(&term.connection.model, &connection.model)
+            }) {
                 let receiver = connection.wake.clone();
                 let handle = self.handle.clone();
                 let wake_key = key.clone();
@@ -603,12 +720,24 @@ impl Workspace {
             );
         }
         self.hosts[index].model = model;
+        if self
+            .ports_target()
+            .is_some_and(|target| !self.ports_in_context(target))
+        {
+            self.close_panel(tx);
+        }
+        self.refresh_ports_watch();
         if index == self.active {
             // The session, keymap revision or connection above is what a mode belongs to.
             self.revalidate_key_modes();
         }
+        self.reconcile_copy_mode();
+        self.reconcile_focus_history(index, tx);
+        self.process_prompt_events(index, prompt_events, tx);
         self.announce_keymap_problems(index);
-        self.poll_remote_navigation(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.poll_remote_navigation(now);
+        self.poll_remote_mutes(now);
         for pending in performs {
             self.remote_perform(index, pending, tx);
         }
@@ -618,10 +747,16 @@ impl Workspace {
             self.keymap_generation,
         );
         for queued in client_actions {
-            // File dialogs need this person's own key or click, whatever a host returns.
+            // These actions need this person's own key or click, whatever a host returns.
             if super::actions::find(&queued.action.action).is_some_and(|s| s.requires_person()) {
                 self.inform(if queued.action.action == super::server_page::STOP {
                     "Returned client action skipped: only the person at this computer can stop a server."
+                } else if queued.action.action == super::ports::ACTION {
+                    "Returned client action skipped: only the person at this computer can show listening ports."
+                } else if queued.action.action == super::actions::UNDO_CLOSE {
+                    "Returned client action skipped: only the person at this computer can undo a close."
+                } else if queued.action.action == super::actions::FOCUS_HISTORY_REVERSE {
+                    "Returned client action skipped: only the person at this computer can step through focus history."
                 } else {
                     "Returned client action skipped: a host cannot start a download or open the path browser."
                 });
@@ -665,7 +800,11 @@ impl Workspace {
         self.ring_bells(index, bells);
         self.track_activity(index);
         self.restore_activity_selection(activity_selection);
+        self.restore_row_selection();
+        self.seed_ports_selection();
         self.deliver_program_notices(index, notices);
+        self.sync_layer_menu(tx);
+        self.sync_layer_drag();
         if self
             .panel
             .as_ref()
@@ -678,8 +817,17 @@ impl Workspace {
         self.sync_tabs(index, tx);
         self.process_downloads(index, tx);
         self.process_directory(index);
+        self.apply_shared_writes(shared_writes, tx);
+        let Some(index) = self.host_index(id) else {
+            return;
+        };
+        self.sync_shared_hosts(index, tx);
+        let Some(index) = self.host_index(id) else {
+            return;
+        };
         if index == self.active && old_session != self.hosts[index].model.selected {
             self.drag = None;
+            self.layer_drag = None;
         }
         if changed_session && self.hosts[index].model.selected.is_some() {
             self.save();
@@ -734,6 +882,7 @@ impl Workspace {
             self.forwarded.clear();
         }
         if !focused {
+            self.cancel_layer_drag();
             for term in self.terminals.values_mut() {
                 term.end_selection();
             }
@@ -884,6 +1033,7 @@ impl Workspace {
             term.cache_images(self.images.as_ref());
             term.resize_if_owner(cell);
         }
+        self.reconcile_copy_mode_wake(key);
         self.place_find(key);
     }
 
@@ -1159,6 +1309,12 @@ impl Workspace {
 
     /// Opens the focused terminal's search field, or gives it back the keyboard.
     pub fn open_search(&mut self) {
+        self.clear_focus_history_walk();
+        self.cancel_layer_drag();
+        if self.in_copy_mode() {
+            self.open_copy_mode_search(super::copy_mode::SearchDirection::Forward);
+            return;
+        }
         if let Some(term) = self.active_terminal_mut() {
             term.search.get_or_insert_with(|| TextEdit::new("")).focused = true;
         }
@@ -1204,7 +1360,9 @@ impl Workspace {
     }
 
     pub fn request(&mut self, method: &str, mut payload: Value) {
+        self.clear_focus_history_walk();
         if method.starts_with("session.focus") {
+            self.exit_copy_mode();
             self.bindings.sequence.clear();
         }
         let Some(session) = self.model().selected.clone() else {
@@ -1267,6 +1425,7 @@ impl Workspace {
             palette_of(self.settings.chrome_theme),
         )
         .with_selection(super::term::SelectionLook::of(&self.settings.terminal))
+        .with_program_background(self.settings.terminal.keep_program_background)
     }
 
     /// Declare the theme the user chose, `choice`, from now on, on every host, and remember
@@ -1356,12 +1515,15 @@ impl Workspace {
     }
 
     pub fn activate_host(&mut self, host: usize, tx: &mut Tx) {
+        self.clear_focus_history_walk();
+        self.exit_copy_mode();
         self.bindings.sequence.clear();
         self.observe_navigation();
         self.navigation.cancel();
         self.settings.hosts[host].collapsed = false;
         self.active = host;
         self.drag = None;
+        self.layer_drag = None;
         self.update_visibility();
         self.observe_navigation();
         self.save();
@@ -1373,6 +1535,12 @@ impl Workspace {
     /// back a mode nobody entered again.
     pub fn update_visibility(&mut self) {
         self.revalidate_key_modes();
+        if self
+            .ports_target()
+            .is_some_and(|target| !self.ports_in_context(target))
+        {
+            self.cancel_panel_quiet();
+        }
         for term in self.terminals.values_mut() {
             term.end_selection();
         }
@@ -1408,17 +1576,26 @@ impl Workspace {
     }
 
     pub fn toggle_sidebar(&mut self) {
+        self.clear_focus_history_walk();
         self.sidebar.toggle();
         self.save();
     }
 
     pub fn perform(&mut self, action: Intent, tx: &mut Tx) {
-        // Applying a theme goes back to Settings itself.
+        if !matches!(
+            action,
+            Intent::ClientAction(super::actions::FOCUS_HISTORY_REVERSE, _)
+        ) {
+            self.clear_focus_history_walk();
+        }
+        // Applying a theme goes back to Settings itself; copying a port keeps the list open.
         if !action.opens_followup()
             && !matches!(
                 action,
-                Intent::Theme(_)
+                Intent::Port(_)
+                    | Intent::Theme(_)
                     | Intent::Chrome(_)
+                    | Intent::SshAgent(_)
                     | Intent::Choose(_)
                     | Intent::Shortcuts(_)
                     | Intent::Font(_)
@@ -1432,7 +1609,10 @@ impl Workspace {
         if let Some(panel) = &mut self.panel {
             if !matches!(
                 action,
-                Intent::Pane(..) | Intent::MovePaneTo(_) | Intent::InsertPath(_)
+                Intent::Pane(..)
+                    | Intent::LayerMenu(_)
+                    | Intent::MovePaneTo(_)
+                    | Intent::InsertPath(_)
             ) {
                 panel.target = None;
             }
@@ -1443,6 +1623,7 @@ impl Workspace {
         match action {
             Intent::Select(host, id) => self.select(host, id, tx),
             Intent::ActivityTab(target) => self.choose_activity(target, tx),
+            Intent::Port(key) => self.use_port(&key, false, tx),
             Intent::Tab(id) => {
                 if let Some(session) = self.model().selected.clone() {
                     self.select_window(self.active, session, id, tx);
@@ -1479,6 +1660,15 @@ impl Workspace {
                     self.panel.as_mut().unwrap().selected = current;
                 }
             }
+            Intent::ChooseSshAgent => self.open_ssh_agents(),
+            Intent::SshAgent(agent) => {
+                self.select_ssh_agent(agent);
+                match self.settings_back() {
+                    Some(back) => self.panel = Some(back),
+                    None => self.close_panel(tx),
+                }
+            }
+            Intent::SshAgentCustom => self.open_ssh_agent_custom(),
             Intent::Choose(index) => self.choose(index, tx),
             Intent::Chrome(chrome) => {
                 self.set_chrome(chrome, tx);
@@ -1520,17 +1710,35 @@ impl Workspace {
                 );
             }
             Intent::Pane(target, action) => self.pane_action(target, action, tx),
+            Intent::Layer(target, action) => self.layer_action(target, action),
+            Intent::LayerMenu(target) => self.layer_menu(target),
             Intent::Session(target, action) => self.session_action(target, action, tx),
             Intent::AddHost => self.open_add_host(),
             Intent::StartSsh(host) => self.preview_ssh_start(host),
+            Intent::InstallSsh(host) => self.preview_ssh_install(host),
+            Intent::HostKey(host) => self.preview_host_key(host),
             Intent::AddMachine(index) => self.add_machine(index, tx),
             Intent::MachineForm(index) => self.machine_form(index),
-            Intent::AddHostManually => self.open_panel(
-                PanelKind::Form(Form::AddHost),
-                "Add host by endpoint",
-                &[("Host name", "my-host", ""), ("Endpoint", "https://host.example.ts.net, ssh://user@host[/socket] or unix:///path", "")],
-            ),
+            Intent::AddHostManually => {
+                let save_shared = self.can_save_shared_host();
+                self.open_panel(
+                    PanelKind::Form(Form::AddHost),
+                    "Add host by endpoint",
+                    &[
+                        ("Host name", "my-host", ""),
+                        (
+                            "Endpoint",
+                            "https://host.example.ts.net, ssh://user@host[/socket] or unix:///path",
+                            "",
+                        ),
+                    ],
+                );
+                if let Some(panel) = &mut self.panel {
+                    panel.save_shared = save_shared;
+                }
+            }
             Intent::NewWindow => {
+                self.exit_copy_mode();
                 if let Some(session) = self.model().selected.clone() {
                     let from = self.focused_block();
                     let layout = self.new_terminal(self.active);
@@ -1539,6 +1747,7 @@ impl Workspace {
                 }
             }
             Intent::Split(direction) => {
+                self.exit_copy_mode();
                 if let (Some(session), Some(block)) = (self.model().selected.clone(), self.focused_block()) {
                     let layout = self.new_terminal(self.active);
                     let payload = self.split_payload(self.active, &block, direction, layout);
@@ -1572,6 +1781,9 @@ impl Workspace {
             }
             Intent::Sidebar => self.toggle_sidebar(),
             Intent::Settings => {
+                self.exit_copy_mode();
+                self.cancel_layer_drag();
+                self.leave_install_dialog();
                 self.bindings.sequence.clear();
                 self.reload_shortcuts();
                 self.shortcut_filter = TextEdit::new("");
@@ -1580,10 +1792,15 @@ impl Workspace {
                 let back = self.panel.take();
                 self.panel = Some(Panel::new(PanelKind::Settings, "Settings", &[]));
                 self.panel.as_mut().unwrap().target = back.and_then(|p| p.target);
+                self.refresh_ports_watch();
                 if self.settings_section == SettingsSection::Notifications {
                     self.notification_command(super::notify::Command::Check);
                     self.sound_request(super::sounds::Request::Check);
                 }
+                if self.settings_section == SettingsSection::Hosts {
+                    self.refresh_ssh_agents(false);
+                }
+                self.reconcile_prompts();
             }
             Intent::Updates => self.open_updates_settings(),
             Intent::About => {
@@ -1593,7 +1810,31 @@ impl Workspace {
             Intent::CheckUpdates => self.check_updates_now(),
             Intent::Downloads => self.open_panel(PanelKind::Downloads, "Downloads", &[]),
             Intent::EditHost(host) => {
+                if host >= self.settings.hosts.len() {
+                    return;
+                }
+                if let Some(reason) = self.shared_write_blocked(host) {
+                    self.inform(format!(
+                        "{} cannot be edited: {reason}. Edit its default shell locally, or turn off shared host sync in Settings → Remote Hosts.",
+                        self.settings.hosts[host].label
+                    ));
+                    return;
+                }
+                if let Some(link) = &self.settings.hosts[host].shared
+                    && self.is_shared_managed(host)
+                    && self.has_pending_shared_write_for(&link.id)
+                {
+                    self.inform(format!(
+                        "A shared host change for {} is already in progress.",
+                        self.settings.hosts[host].label
+                    ));
+                    return;
+                }
                 let h = self.settings.hosts[host].clone();
+                let opened_shared_id = self
+                    .is_shared_managed(host)
+                    .then(|| h.shared.as_ref().map(|l| l.id.clone()))
+                    .flatten();
                 self.open_panel(
                     PanelKind::Form(Form::EditHost(host)),
                     &format!("Edit {}", h.label),
@@ -1603,13 +1844,46 @@ impl Workspace {
                         ("Default shell", "Server default — e.g. zsh or /bin/zsh", h.shell.as_deref().unwrap_or("")),
                     ],
                 );
+                if let Some(panel) = &mut self.panel {
+                    panel.opened_shared_id = opened_shared_id;
+                }
             }
             Intent::RemoveHost(host) => {
+                if self.settings.hosts.len() <= 1 || host >= self.settings.hosts.len() {
+                    return;
+                }
+                if let Some(reason) = self.shared_write_blocked(host) {
+                    self.inform(format!(
+                        "{} cannot be removed: {reason}. Turn off shared host sync in Settings → Remote Hosts to manage it locally.",
+                        self.settings.hosts[host].label
+                    ));
+                    return;
+                }
+                if let Some(link) = &self.settings.hosts[host].shared
+                    && self.is_shared_managed(host)
+                    && self.has_pending_shared_write_for(&link.id)
+                {
+                    self.inform(format!(
+                        "A shared host change for {} is already in progress.",
+                        self.settings.hosts[host].label
+                    ));
+                    return;
+                }
                 let label = self.settings.hosts[host].label.clone();
+                let opened_shared_id = self
+                    .is_shared_managed(host)
+                    .then(|| self.settings.hosts[host].shared.as_ref().map(|l| l.id.clone()))
+                    .flatten();
                 self.open_panel(PanelKind::RemoveHost(host), &format!("Remove {label}?"), &[]);
+                if let Some(panel) = &mut self.panel {
+                    panel.opened_shared_id = opened_shared_id;
+                }
             }
             Intent::Retry => self.send(self.active, HostCommand::Reconnect),
             Intent::Command(command) => command.run(self, tx),
+            Intent::OpenPrompt(key) => {
+                self.open_prompt(key, std::time::Instant::now());
+            }
             Intent::Shortcuts(item) => self.shortcut_menu(item, tx),
         }
     }
@@ -1620,6 +1894,8 @@ impl Workspace {
         if !self.hosts[host].model.connected {
             return;
         }
+        self.clear_focus_history_walk();
+        self.exit_copy_mode();
         self.navigation.cancel();
         if self.panel.is_some() {
             self.close_panel(tx);
@@ -1627,6 +1903,7 @@ impl Workspace {
         self.settings.hosts[host].collapsed = false;
         self.active = host;
         self.drag = None;
+        self.layer_drag = None;
         self.update_visibility();
         self.save();
         self.update_title(tx);
@@ -1690,20 +1967,58 @@ impl Workspace {
             })
     }
 
+    /// The floating-layer verbs for a captured pane, anchored where the pane menu was: the
+    /// second page behind the pane menu's one layer row.
+    fn layer_menu(&mut self, layer: LayerTarget) {
+        let Some(root) = self
+            .panel
+            .as_ref()
+            .filter(|p| matches!(p.kind, PanelKind::Pane))
+        else {
+            return;
+        };
+        if let Some(reason) = self.layer_root_blocked(root, &layer) {
+            self.inform(reason.sentence());
+            return;
+        }
+        let title = format!("{} · {}", layer.tab, layer.pane);
+        let anchor = root.anchor;
+        let target = root.target.clone();
+        self.open_panel(PanelKind::Layer, &title, &[]);
+        let panel = self.panel.as_mut().expect("the layer menu");
+        panel.target = target;
+        panel.layer = Some(layer);
+        panel.anchor = anchor;
+        if let Some(first) = self.entries().iter().position(|e| e.enabled) {
+            self.panel.as_mut().unwrap().selected = first;
+        }
+        self.reconcile_prompts();
+    }
+
     pub fn pane_menu(&mut self, block: String, anchor: Option<(f32, f32)>) {
         let anchor = anchor.map(|(x, y)| (x / self.ui_scale(), y / self.ui_scale()));
         let Some(target) = self.target(&block) else {
             return;
         };
-        let title = format!("{} · {}", target.tab, target.name);
+        let layer = if self.layer_gate().is_none() {
+            self.capture_pane_layer(&target)
+        } else {
+            None
+        };
+        let title = match &layer {
+            Some(layer) => format!("{} · {}", layer.tab, layer.pane),
+            None => format!("{} · {}", target.tab, target.name),
+        };
         self.open_panel(PanelKind::Pane, &title, &[]);
         let panel = self.panel.as_mut().unwrap();
         panel.target = Some(target);
+        panel.layer = layer;
         panel.anchor = anchor;
         // The rows' availability is the target's (Copy needs its selection), known only now.
         if let Some(first) = self.entries().iter().position(|e| e.enabled) {
             self.panel.as_mut().unwrap().selected = first;
         }
+        self.reconcile_prompts();
     }
 
     /// A sidebar session row's right-click menu, at the pointer (window points).
@@ -1734,6 +2049,7 @@ impl Workspace {
         if let Some(first) = self.entries().iter().position(|e| e.enabled) {
             self.panel.as_mut().unwrap().selected = first;
         }
+        self.reconcile_prompts();
     }
 
     /// Every session action names its own host and session, never the selected one.
@@ -1877,6 +2193,7 @@ impl Workspace {
             | PaneAction::Paste
             | PaneAction::SelectAll
             | PaneAction::CopyId
+            | PaneAction::Ports
             | PaneAction::Clear
             | PaneAction::Reset => self.pane_verb(target, action, tx),
         }
@@ -1909,6 +2226,9 @@ impl Workspace {
     }
 
     pub(super) fn confirm(&mut self, title: &str, method: &str, payload: Value, description: &str) {
+        self.clear_focus_history_walk();
+        self.exit_copy_mode();
+        self.cancel_layer_drag();
         let target = self.panel.as_ref().and_then(|p| p.target.clone());
         let mut panel = Panel::new(
             PanelKind::Confirm {
@@ -1933,6 +2253,8 @@ impl Workspace {
                 Box::new(p)
             });
         self.panel = Some(panel);
+        self.refresh_ports_watch();
+        self.reconcile_prompts();
     }
 
     pub fn picker(&mut self, sessions: bool) {
@@ -1962,6 +2284,10 @@ impl Workspace {
     }
 
     pub fn open_panel(&mut self, kind: PanelKind, title: &str, fields: &[(&str, &str, &str)]) {
+        self.clear_focus_history_walk();
+        self.exit_copy_mode();
+        self.cancel_layer_drag();
+        self.leave_install_dialog();
         self.bindings.sequence.clear();
         for term in self.terminals.values_mut() {
             term.end_selection();
@@ -1977,10 +2303,13 @@ impl Workspace {
                     | PanelKind::RemoveHost(_)
                     | PanelKind::AgentChange { .. }
                     | PanelKind::StartSsh { .. }
+                    | PanelKind::InstallSsh { .. }
                     | PanelKind::PairDevice(_)
+                    | PanelKind::Prompt(_)
                     | PanelKind::Themes
                     | PanelKind::Fonts(_)
                     | PanelKind::Chromes
+                    | PanelKind::SshAgents
                     | PanelKind::Choice(_)
                     | PanelKind::Discover
                     | PanelKind::ShortcutMenu
@@ -1988,6 +2317,10 @@ impl Workspace {
             ) && previous
                 .as_ref()
                 .is_some_and(|p| matches!(p.kind, PanelKind::Settings)))
+            || (matches!(kind, PanelKind::Form(Form::SshAgentSocket))
+                && previous
+                    .as_ref()
+                    .is_some_and(|p| matches!(p.kind, PanelKind::SshAgents)))
             || (matches!(
                 kind,
                 PanelKind::Form(Form::AddSsh(_) | Form::AddHost | Form::Discovered(_))
@@ -2003,8 +2336,14 @@ impl Workspace {
         };
         self.panel = Some(panel);
         if let Some(first) = self.entries().iter().position(|e| e.enabled) {
-            self.panel.as_mut().unwrap().selected = first;
+            if self.ports_target().is_some() {
+                self.select_row(first);
+            } else {
+                self.panel.as_mut().unwrap().selected = first;
+            }
         }
+        self.refresh_ports_watch();
+        self.reconcile_prompts();
     }
 
     /// The Settings panel a form or confirmation was opened from, to return to after it,
@@ -2032,6 +2371,9 @@ impl Workspace {
         if section == SettingsSection::Shortcuts {
             self.reload_shortcuts();
         }
+        if section == SettingsSection::Hosts {
+            self.refresh_ssh_agents(false);
+        }
         if section == SettingsSection::Integrations
             && self.integrations.status == super::integrations::AgentStatus::Unknown
         {
@@ -2047,19 +2389,27 @@ impl Workspace {
     }
 
     pub fn close_panel(&mut self, tx: &mut Tx) {
+        self.leave_install_dialog();
         self.recorder = None;
         self.leave_download_dialog();
         self.bindings.sequence.clear();
         self.panel = None;
+        self.refresh_ports_watch();
+        self.reconcile_prompts();
         tx.blur();
     }
 
     /// Escape on a modal: back to the panel it came from, or closed.
     pub fn cancel_panel_quiet(&mut self) {
+        if self.is_prompt_open() {
+            self.cancel_open_prompt(None);
+            return;
+        }
         if self.leave_folder_field() {
             return;
         }
         self.leave_download_dialog();
+        self.leave_install_dialog();
         if let Some(mut back) = self.panel.as_mut().and_then(|p| p.back.take()) {
             if let Some(input) = back.inputs.first_mut() {
                 input.focused = true;
@@ -2068,18 +2418,27 @@ impl Workspace {
         } else {
             self.panel = None;
         }
+        self.refresh_ports_watch();
+        self.reconcile_prompts();
     }
 
     pub fn cancel_panel(&mut self, tx: &mut Tx) {
+        if self.is_prompt_open() {
+            self.cancel_open_prompt(Some(tx));
+            return;
+        }
         if self.leave_folder_field() {
             return;
         }
         self.leave_download_dialog();
+        self.leave_install_dialog();
         if let Some(mut back) = self.panel.as_mut().and_then(|p| p.back.take()) {
             if let Some(input) = back.inputs.first_mut() {
                 input.focused = true;
             }
             self.panel = Some(*back);
+            self.refresh_ports_watch();
+            self.reconcile_prompts();
         } else {
             self.close_panel(tx);
         }
@@ -2087,16 +2446,67 @@ impl Workspace {
 
     pub fn navigate_panel(&mut self, delta: isize) {
         let entries = self.entries();
-        if let Some(panel) = &mut self.panel {
-            let mut selected = panel.selected as isize + delta;
-            while selected >= 0 && (selected as usize) < entries.len() {
-                if entries[selected as usize].enabled {
-                    panel.selected = selected as usize;
-                    panel.reveal = true;
-                    break;
-                }
-                selected += delta.signum();
+        if self.ports_target().is_some()
+            && let Some((_, id)) = self.panel.as_ref().and_then(|p| p.row.as_ref())
+            && !entries.iter().any(|e| e.id.as_deref() == Some(id))
+        {
+            self.select_row(0);
+            return;
+        }
+        let Some(mut selected) = self.panel.as_ref().map(|p| p.selected as isize + delta) else {
+            return;
+        };
+        while selected >= 0 && (selected as usize) < entries.len() {
+            if entries[selected as usize].enabled {
+                self.select_row(selected as usize);
+                break;
             }
+            selected += delta.signum();
+        }
+    }
+
+    /// Point the keyboard at entry `index` and remember which row that is: a host wake that
+    /// reorders the list keeps the highlight on this row instead of on whatever moved into its
+    /// place (`restore_row_selection`), and Enter runs it (`submit`). Only the paths that move
+    /// the keyboard record it; a row chosen some other way is acted on where it is.
+    pub fn select_row(&mut self, index: usize) {
+        let row = self
+            .entries()
+            .get(index)
+            .and_then(|entry| entry.id.as_deref().map(str::to_owned));
+        if let Some(panel) = self.panel.as_mut() {
+            panel.reveal |= index != panel.selected;
+            panel.row = row.map(|row| (index, row));
+            panel.selected = index;
+        }
+    }
+
+    /// Keep the keyboard's row while a host wake rebuilds the list it points at: the row the
+    /// keyboard left its highlight on is followed to its new position, and one that is gone
+    /// leaves the highlight alone and runs nothing (`submit`). A selection made some other way
+    /// — a pointer hover, a row with no identity — is left exactly as it was.
+    pub fn restore_row_selection(&mut self) {
+        let Some(panel) = self.panel.as_ref() else {
+            return;
+        };
+        let selected = panel.selected;
+        let Some((index, row)) = panel.row.clone() else {
+            return;
+        };
+        if index != selected {
+            return;
+        }
+        let entries = self.entries();
+        // Found: follow the row. Gone: the highlight stays where it is and this row is never
+        // retargeted, so `submit` refuses it until the keyboard picks another row.
+        if let Some(found) = entries
+            .iter()
+            .position(|entry| entry.id.as_deref() == Some(row.as_str()))
+        {
+            let panel = self.panel.as_mut().unwrap();
+            panel.reveal |= found != panel.selected;
+            panel.selected = found;
+            panel.row = Some((found, row));
         }
     }
 
@@ -2119,13 +2529,19 @@ impl Workspace {
         }
         let first = self.entries().iter().position(|e| e.enabled).unwrap_or(0);
         if let Some(panel) = &mut self.panel {
-            panel.selected = first;
             panel.error = None;
+        }
+        self.select_row(first);
+        if let Some(panel) = &mut self.panel {
             panel.reveal = true;
         }
     }
 
     pub fn submit(&mut self, tx: &mut Tx) {
+        if self.ports_target().is_some() {
+            self.submit_port(false, tx);
+            return;
+        }
         let Some(panel) = &self.panel else { return };
         let kind = panel.kind.clone();
         let values: Vec<String> = panel
@@ -2135,13 +2551,24 @@ impl Workspace {
             .collect();
         if panel.is_list() {
             let selected = panel.selected;
-            if let Some(entry) = self
-                .entries()
-                .into_iter()
-                .nth(selected)
-                .filter(|e| e.enabled)
-            {
-                self.perform(entry.action, tx);
+            let row = panel.row.clone();
+            let entries = self.entries();
+            // A row with an identity runs by it: a list the server reordered under the
+            // keyboard must not hand Enter the row that took its place. A row that is no
+            // longer listed runs nothing.
+            let index = match &row {
+                Some((index, row)) if *index == selected => entries
+                    .iter()
+                    .position(|entry| entry.id.as_deref() == Some(row.as_str())),
+                _ => Some(selected),
+            };
+            let Some(index) = index else {
+                self.inform("That row is no longer in the list. Nothing was changed.");
+                return;
+            };
+            if let Some(entry) = entries.get(index).filter(|e| e.enabled) {
+                let action = entry.action.clone();
+                self.perform(action, tx);
             }
             return;
         }
@@ -2156,6 +2583,8 @@ impl Workspace {
                 } else if let Form::DownloadFolder = form {
                     // Empty goes back to the system's Downloads folder.
                     super::downloads::folder_error(&values[0]).map(str::to_owned)
+                } else if let Form::SshAgentSocket = form {
+                    super::ssh_agent::validate_socket_form(&values[0]).err()
                 } else if values.first().is_none_or(|s| s.is_empty()) {
                     Some("Enter a name".to_owned())
                 } else if let Form::AddSsh(index) = form {
@@ -2165,6 +2594,12 @@ impl Workspace {
                         Form::EditHost(i) => Some(i),
                         _ => None,
                     };
+                    let editing_shared_id = editing.and_then(|i| {
+                        self.settings
+                            .hosts
+                            .get(i)
+                            .and_then(|h| h.shared.as_ref().map(|l| l.id.as_str()))
+                    });
                     validate_host(&values[0], &values[1])
                         .err()
                         .map(|e| e.to_string())
@@ -2173,8 +2608,18 @@ impl Workspace {
                                 .hosts
                                 .iter()
                                 .enumerate()
-                                .any(|(i, h)| Some(i) != editing && h.endpoint == values[1])
+                                .any(|(i, h)| {
+                                    Some(i) != editing
+                                        && rex_rune::hosts::same_endpoint(&h.endpoint, &values[1])
+                                })
                                 .then(|| "This endpoint is already in the workspace".to_owned())
+                        })
+                        .or_else(|| {
+                            self.has_pending_shared_write_endpoint(&values[1], editing_shared_id)
+                                .then(|| {
+                                    "A shared host change for this endpoint is already in progress."
+                                        .to_owned()
+                                })
                         })
                         .or_else(|| {
                             values
@@ -2186,6 +2631,45 @@ impl Workspace {
                                     "Enter one shell name or path, without arguments.".to_owned()
                                 })
                         })
+                        .or_else(|| {
+                            let panel = self.panel.as_ref()?;
+                            match form {
+                                Form::AddHost if panel.save_shared && !self.can_save_shared_host() => {
+                                    Some("Local Rex server is not ready to save shared hosts. Turn off \"Save to shared Rex host list\" to add locally, or reconnect first.".to_owned())
+                                }
+                                Form::EditHost(host) => {
+                                    let saved = self.settings.hosts.get(host)?;
+                                    let label_or_ep_changed =
+                                        saved.label != values[0] || saved.endpoint != values[1];
+                                    if !label_or_ep_changed {
+                                        return None;
+                                    }
+                                    let current_shared_id = self
+                                        .is_shared_managed(host)
+                                        .then(|| saved.shared.as_ref().map(|l| l.id.clone()))
+                                        .flatten();
+                                    if panel.opened_shared_id != current_shared_id {
+                                        return Some(
+                                            "This host's shared status changed while Edit host was open. Reopen Edit host to edit it."
+                                                .to_owned(),
+                                        );
+                                    }
+                                    if let Some(reason) = self.shared_write_blocked(host) {
+                                        return Some(reason);
+                                    }
+                                    if let Some(id) = current_shared_id.as_deref()
+                                        && self.has_pending_shared_write_for(id)
+                                    {
+                                        return Some(
+                                            "A shared host change for this host is already in progress."
+                                                .to_owned(),
+                                        );
+                                    }
+                                    None
+                                }
+                                _ => None,
+                            }
+                        })
                 } else {
                     None
                 };
@@ -2193,6 +2677,7 @@ impl Workspace {
                     self.panel.as_mut().unwrap().error = Some(error);
                     return;
                 }
+                let save_shared = self.panel.as_ref().is_some_and(|p| p.save_shared);
                 let target = self.panel.as_ref().and_then(|p| p.target.clone());
                 let tab = self.panel.as_ref().and_then(|p| p.tab.clone());
                 let back = self.settings_back();
@@ -2209,6 +2694,13 @@ impl Workspace {
                         self.save();
                     }
                     Form::DownloadFolder => self.set_download_folder(&values[0]),
+                    Form::SshAgentSocket => {
+                        if let Ok(socket) = super::ssh_agent::validate_socket_form(&values[0]) {
+                            self.select_ssh_agent(rex_rune::settings::ssh::SshAgent::Socket(
+                                socket,
+                            ));
+                        }
+                    }
                     Form::RenameSession(None) => self.request("session.set_label", json!({"label":values[0]})),
                     Form::RenameSession(Some(session)) => {
                         self.session_request(&session, "session.set_label", json!({"label":values[0]}))
@@ -2227,13 +2719,20 @@ impl Workspace {
                         ),
                         None => self.request("session.set_block_label", json!({"block_id":id,"label":values[0]})),
                     },
+                    Form::AddHost if save_shared => {
+                        if let Err(reason) = self.start_shared_add(values[0].clone(), values[1].clone()) {
+                            self.notify(reason);
+                        }
+                    }
                     Form::AddHost | Form::Discovered(_) => self.add_host(
                         Host {
                             label: values[0].clone(),
                             endpoint: values[1].clone(),
                             remote_control: false,
+                            prompts: true,
                             collapsed: false,
                             shell: None,
+                            shared: None,
                         },
                         tx,
                     ),
@@ -2245,23 +2744,61 @@ impl Workspace {
                                 label: values[0].clone(),
                                 endpoint,
                                 remote_control: false,
+                                prompts: true,
                                 collapsed: false,
                                 shell: None,
+                                shared: None,
                             },
                             tx,
                         );
                     }
                     Form::EditHost(host) => {
                         let shell = values.get(2).filter(|v| !v.is_empty()).cloned();
-                        self.edit_host(host, values[0].clone(), values[1].clone(), shell);
+                        let shared_label_or_ep_changed = self.is_shared_managed(host)
+                            && self.settings.hosts.get(host).is_some_and(|saved| {
+                                saved.label != values[0] || saved.endpoint != values[1]
+                            });
+                        if shared_label_or_ep_changed {
+                            if let Err(reason) = self.start_shared_edit(
+                                host,
+                                values[0].clone(),
+                                values[1].clone(),
+                                shell,
+                                true,
+                                None,
+                            ) {
+                                self.notify(reason);
+                            }
+                        } else {
+                            self.edit_host(host, values[0].clone(), values[1].clone(), shell);
+                        }
                     }
                 }
                 self.update_title(tx);
                 self.panel = back.or(self.panel.take());
             }
             PanelKind::RemoveHost(host) => {
+                let opened_shared_id = self.panel.as_ref().and_then(|p| p.opened_shared_id.clone());
                 let back = self.settings_back();
-                self.remove_host(host, tx);
+                self.close_panel(tx);
+                if let Some(saved) = self.settings.hosts.get(host).cloned() {
+                    let current_shared_id = self
+                        .is_shared_managed(host)
+                        .then(|| saved.shared.as_ref().map(|l| l.id.clone()))
+                        .flatten();
+                    if opened_shared_id != current_shared_id {
+                        self.inform(format!(
+                            "{} changed while the confirmation was open. Nothing was removed.",
+                            saved.label
+                        ));
+                    } else if current_shared_id.is_some() {
+                        if let Err(reason) = self.start_shared_remove(host) {
+                            self.notify(format!("Could not remove {}: {reason}.", saved.label));
+                        }
+                    } else {
+                        self.remove_host(host, tx);
+                    }
+                }
                 self.panel = back;
             }
             PanelKind::ResetShortcuts => {
@@ -2289,14 +2826,29 @@ impl Workspace {
                 }
                 let target = self.panel.as_ref().and_then(|p| p.target.clone());
                 let session = self.panel.as_ref().and_then(|p| p.session.clone());
+                let layer = self.panel.as_ref().and_then(|p| p.layer.clone());
                 let tab = self.panel.as_ref().and_then(|p| p.tab.clone());
                 self.close_panel(tx);
+                // A layer close names its own session and layer: it never falls back to the
+                // session on screen, and a changed layer closes nothing.
+                if let Some(layer) = layer {
+                    self.confirmed_layer_close(&layer);
+                    return;
+                }
                 if let Some(tab) = tab {
-                    self.confirmed_tab_close(&tab, &method, payload);
+                    self.confirmed_tab_close(&tab, payload);
                     return;
                 }
                 if let Some(session) = session {
-                    self.session_request(&session, &method, payload);
+                    let mut payload = payload;
+                    payload["session_id"] = json!(session.session);
+                    self.send(
+                        session.host,
+                        HostCommand::Close {
+                            kind: HumanClose::Session,
+                            payload,
+                        },
+                    );
                     return;
                 }
                 match target.filter(|_| method == "block.close") {
@@ -2304,7 +2856,25 @@ impl Workspace {
                         self.confirmed_pane_close(&target, &payload);
                     }
                     Some(target) => {
-                        self.send(target.host, HostCommand::Request { method, payload })
+                        self.send(
+                            target.host,
+                            HostCommand::Close {
+                                kind: HumanClose::Pane,
+                                payload,
+                            },
+                        );
+                    }
+                    None if method == "session.close_window" || method == "block.close" => {
+                        if let Some(session) = &self.model().selected {
+                            let mut payload = payload;
+                            payload["session_id"] = json!(session);
+                            let kind = if method == "block.close" {
+                                HumanClose::Pane
+                            } else {
+                                HumanClose::Tab
+                            };
+                            self.send(self.active, HostCommand::Close { kind, payload });
+                        }
                     }
                     None => self.request(&method, payload),
                 }

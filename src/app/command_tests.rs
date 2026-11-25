@@ -11,14 +11,14 @@ use rexrs::api::client::{Binding, InspectResponseAction};
 use serde_json::{Value, json};
 
 /// Every row Commands lists for `fixture()`, in order. A row leaving this list is a command
-/// someone can no longer reach: remove its id here only on purpose. `host.start_server` and
-/// `app.update` are listed only while they apply (a host waiting for a server, a verified
-/// update).
+/// someone can no longer reach: remove its id here only on purpose. `host.start_server`,
+/// `host.check_key`, `host.install_rex` and `app.update` are listed only while they apply.
 const IDS: &[&str] = &[
     "session.switch",
     "client.activity",
     "client.activity.priority",
     "client.activity.session",
+    "client.ports",
     "session.new",
     "session.rename",
     "session.next",
@@ -26,6 +26,8 @@ const IDS: &[&str] = &[
     "session.last",
     "history.back",
     "history.forward",
+    "focus_history.reverse",
+    "focus_history.session",
     "session.refresh",
     "session.close",
     "tab.new",
@@ -34,6 +36,7 @@ const IDS: &[&str] = &[
     "tab.previous",
     "tab.next_global",
     "tab.previous_global",
+    "focus_history.tab",
     "tab.mute",
     "tab.move_left",
     "tab.move_right",
@@ -42,6 +45,7 @@ const IDS: &[&str] = &[
     "pane.copy",
     "pane.paste",
     "pane.select_all",
+    "pane.copy_mode",
     "pane.search",
     "pane.find_next",
     "pane.find_previous",
@@ -51,8 +55,15 @@ const IDS: &[&str] = &[
     "pane.split.up",
     "pane.split.best_fit",
     "pane.zoom",
+    "pane.float",
+    "pane.new_floating",
+    "pane.minimize_layer",
+    "pane.restore_layer",
+    "pane.raise_layer",
+    "pane.return_to_tiles",
     "pane.focus.next",
     "pane.focus.previous",
+    "focus_history.pane",
     "pane.focus.left",
     "pane.focus.right",
     "pane.focus.up",
@@ -82,6 +93,7 @@ const IDS: &[&str] = &[
     "pane.close_focused",
     "pane.close_others",
     "pane.close",
+    "pane.close_layer",
     "host.switch",
     "host.add",
     "host.edit",
@@ -89,6 +101,7 @@ const IDS: &[&str] = &[
     "host.remote_control",
     "host.pair_device",
     "host.reconnect",
+    "client.undo_close",
     "host.collapse_others",
     "host.stop_server",
     "host.remove",
@@ -348,7 +361,9 @@ fn a_search_is_one_list_with_the_best_match_first() {
             "Close pane or tab…",
             "Close other panes…",
             "Close pane…",
-            "Close app"
+            "Close floating layer…",
+            "Close app",
+            "Undo close"
         ]
     );
     assert_eq!(ws.panel.as_ref().unwrap().selected, 0);
@@ -363,8 +378,16 @@ fn a_search_is_one_list_with_the_best_match_first() {
     search(&mut ws, "close pane");
     assert_eq!(
         labels(&ws),
-        ["Close pane…", "Close pane or tab…", "Close other panes…"]
+        [
+            "Close pane…",
+            "Close pane or tab…",
+            "Close other panes…",
+            "Close floating layer…",
+            "Undo close"
+        ]
     );
+    search(&mut ws, "reopen pane");
+    assert_eq!(labels(&ws), ["Undo close"]);
     // Words in any order; each must be found.
     search(&mut ws, "size font");
     assert_eq!(
@@ -404,17 +427,36 @@ fn a_search_still_finds_sessions_and_tabs_after_the_commands() {
     let groups: Vec<&str> = entries.iter().map(|e| e.group.as_str()).collect();
     assert_eq!(
         groups,
-        ["Commands", "Tabs · test-0 / s-label"],
-        "Pair device matches dev, followed by the tab named dev"
+        ["Commands", "Commands", "Tabs · test-0 / s-label"],
+        "Pair device and listening ports match dev, followed by the tab named dev"
     );
-    assert_eq!(labels(&ws), ["Pair device…", "dev"]);
-    assert!(matches!(&entries[1].action, Intent::Tab(id) if id == "split"));
+    assert_eq!(
+        labels(&ws),
+        ["Pair device…", "Show listening ports…", "dev"]
+    );
+    assert!(matches!(&entries[2].action, Intent::Tab(id) if id == "split"));
 
     // Commands come first when both match.
     search(&mut ws, "server");
     let groups: Vec<String> = ws.entries().into_iter().map(|e| e.group).collect();
-    assert_eq!(groups, ["Commands", "Commands", "Tabs · test-0 / s-label"]);
-    assert_eq!(labels(&ws), ["Stop server…", "Add host…", "server"]);
+    assert_eq!(
+        groups,
+        [
+            "Commands",
+            "Commands",
+            "Commands",
+            "Tabs · test-0 / s-label"
+        ]
+    );
+    assert_eq!(
+        labels(&ws),
+        [
+            "Stop server…",
+            "Show listening ports…",
+            "Add host…",
+            "server"
+        ]
+    );
     std::fs::remove_file(&ws.settings_path).ok();
 }
 
@@ -430,6 +472,7 @@ fn hints_are_the_effective_bindings() {
         ("pane.split.right", "Ctrl Shift D"),
         ("pane.focus.left", "Ctrl Alt Left"),
         ("pane.copy", "Ctrl Shift C"),
+        ("pane.copy_mode", "Ctrl Shift X"),
         ("pane.prompt_previous", "Ctrl Shift Up"),
         ("pane.prompt_next", "Ctrl Shift Down"),
         ("pane.close_focused", "Ctrl Shift W"),
@@ -597,6 +640,125 @@ fn close_session_asks_first_and_names_the_session() {
     assert!(ws.panel.is_none());
     assert!(!command(&ws, "session.close").entry.enabled);
     std::fs::remove_file(&ws.settings_path).ok();
+}
+
+#[test]
+fn undo_close_is_local_unbound_and_available_only_on_the_connected_active_host() {
+    let (mut ws, first, second) = fixture();
+    let action = actions::UNDO_CLOSE;
+    let spec = actions::find(action).unwrap();
+    assert!(matches!(spec.remote(), actions::Remote::Never(_)));
+    assert!(spec.requires_person());
+    assert!(ws.shortcut_chords(action, &Value::Null).is_empty());
+    assert!(
+        ws.shortcut_rows().iter().any(|row| {
+            row.action == action && row.title == "Undo close" && row.keys.is_empty()
+        })
+    );
+    overrides(&mut ws, json!([{"keys":"ctrl+alt+f1","action":action}]));
+    for (connected, revision, reason) in [
+        (false, 21, Some("Connect to the host to undo a close")),
+        (true, 10, Some("Requires Rex Server API 20 or later")),
+        (true, 13, Some("Requires Rex Server API 20 or later")),
+        (true, 19, Some("Requires Rex Server API 20 or later")),
+        (true, 20, None),
+        (true, 21, None),
+    ] {
+        let model = &mut ws.hosts[0].model;
+        model.connected = connected;
+        model.protocol.api_revision = revision;
+        model.connection_epoch = 42;
+        model.selected = None;
+        let row = ws
+            .commands()
+            .into_iter()
+            .find(|row| row.id == action)
+            .unwrap();
+        assert_eq!(row.entry.enabled, reason.is_none());
+        if let Some(reason) = reason {
+            assert_eq!(row.entry.detail, reason);
+            run(&mut ws, action);
+            assert!(first.is_empty());
+            assert_eq!(notices(&ws).last(), Some(&reason));
+        } else {
+            assert_eq!(row.entry.keys, ws.shortcut_chords(action, &Value::Null));
+            choose(&mut ws, action);
+            assert!(matches!(
+                first.try_recv(),
+                Ok(HostCommand::UndoClose { epoch: 42 })
+            ));
+        }
+        assert!(second.is_empty());
+    }
+}
+
+#[test]
+fn undo_close_human_confirmations_mark_pane_tab_and_session_even_on_old_clients() {
+    use rex_rune::connection::HumanClose;
+    for revision in [13, 19, 20, 21] {
+        let (mut ws, rx) = tabbed_workspace("split");
+        ws.hosts[0].model.protocol.api_revision = revision;
+        ws.hosts[0].model.sessions = vec![session("s")];
+        for (action, kind) in [
+            ("pane.close", HumanClose::Pane),
+            ("pane.close_others", HumanClose::Pane),
+            ("client.tab.close", HumanClose::Tab),
+            ("client.tab.close_others", HumanClose::Tab),
+            ("session.close", HumanClose::Session),
+        ] {
+            run(&mut ws, action);
+            assert!(matches!(
+                ws.panel.as_ref().unwrap().kind,
+                PanelKind::Confirm { .. }
+            ));
+            assert!(rx.is_empty(), "asks first");
+            ws.submit(&mut rune::Tx::default());
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Ok(HostCommand::Close { kind: actual, payload })
+                        if actual == kind && payload["session_id"] == "s"
+                            && payload.get("undoable").is_none()
+                ),
+                "{action}: the worker, not the UI, adds the flag from the live revision"
+            );
+        }
+    }
+}
+
+#[test]
+fn undo_close_empty_history_notice_reaches_the_ui_and_returned_actions_cannot_undo() {
+    let (mut ws, first, _second) = fixture();
+    let mut model = ws.hosts[0].model.clone();
+    model.protocol.api_revision = 21;
+    model.connection_epoch = 42;
+    model.notice = Some("Nothing to reopen".into());
+    model
+        .client_actions
+        .push(rex_rune::connection::actions::Queued {
+            generation: ws.keymap_generation,
+            session: model.selected.clone(),
+            block: None,
+            action: serde_json::from_value(json!({"action":actions::UNDO_CLOSE})).unwrap(),
+        });
+    *ws.hosts[0].connection.model.lock().unwrap() = model;
+    ws.sync(0, &mut rune::Tx::default());
+    assert_eq!(ws.model().notice.as_deref(), Some("Nothing to reopen"));
+    assert!(notices(&ws).iter().any(|n| n.contains("only the person")));
+    assert!(
+        !first
+            .try_iter()
+            .any(|c| matches!(c, HostCommand::UndoClose { .. }))
+    );
+    let mut rt = runtime(ws);
+    for _ in 0..10 {
+        rt.frame(1. / 60.);
+    }
+    assert!(
+        rt.elements()
+            .iter()
+            .any(|e| e.text.as_deref() == Some("Nothing to reopen"))
+    );
 }
 
 #[test]
@@ -991,6 +1153,9 @@ fn the_list_shows_about_twenty_rows_and_scrolls_to_the_rest() {
     assert!(words.iter().any(|w| w == "Commands"));
     assert!(!headings(&rt).iter().any(|w| w == "Session · s-label"));
     let short = rect(&rt, "results-scroll");
-    assert!(short[3] < 250., "six rows need no scrolling: {short:?}");
+    assert!(
+        short[3] < 340. && rect(&rt, "results")[3] <= short[3] + 1.,
+        "close results fit without scrolling: {short:?}"
+    );
     std::fs::remove_file(&rt.state.settings_path).ok();
 }

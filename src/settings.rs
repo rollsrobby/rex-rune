@@ -2,6 +2,7 @@ pub mod interface;
 pub mod recent_paths;
 pub mod recorded;
 pub mod shortcuts;
+pub mod ssh;
 pub mod terminal;
 pub mod typography;
 
@@ -12,18 +13,31 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Links a saved host row to a record in a Rex server's shared host list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedLink {
+    pub id: String,
+    pub from: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Host {
     pub label: String,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remote_control: bool,
+    /// Whether a prompt-capable app may show this host's Lua questions.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub prompts: bool,
     #[serde(default)]
     pub collapsed: bool,
     /// The shell new terminals on this host start (`zsh`, `/bin/zsh`); none uses the server
     /// user's login shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// Present when this host is linked to a record in a Rex server's shared host list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedLink>,
 }
 
 /// A tab this client keeps quiet: no activity word or progress bar on it and no desktop
@@ -217,10 +231,22 @@ impl ActivityView {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub hosts: Vec<Host>,
+    /// Sync hosts read-only from this machine's Rex server (`hosts.list` / `hosts_changed`).
+    /// Default on and omitted from `workspace.json` when true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub sync_shared_hosts: bool,
     /// None follows the current hostname rather than persisting a snapshot of it.
     pub client_label: Option<String>,
     pub last_host: Option<String>,
@@ -247,6 +273,8 @@ pub struct Settings {
     pub activity_view: ActivityView,
     pub updates: UpdatesConfig,
     pub downloads: DownloadsConfig,
+    #[serde(skip_serializing_if = "ssh::SshConfig::is_default")]
+    pub ssh: ssh::SshConfig,
     /// Passed to `rex skill setup` as `--session-naming`, always explicitly.
     pub agent_session_naming: bool,
     pub chrome_theme: ChromeTheme,
@@ -283,9 +311,12 @@ impl Default for Settings {
                     .to_owned(),
                 endpoint: crate::transport::local_endpoint(),
                 remote_control: false,
+                prompts: true,
                 collapsed: false,
                 shell: None,
+                shared: None,
             }],
+            sync_shared_hosts: true,
             client_label: None,
             last_host: None,
             sessions: HashMap::new(),
@@ -307,6 +338,7 @@ impl Default for Settings {
             activity_view: ActivityView::default(),
             updates: UpdatesConfig::default(),
             downloads: DownloadsConfig::default(),
+            ssh: ssh::SshConfig::default(),
             agent_session_naming: false,
             chrome_theme: ChromeTheme::default(),
             terminal_theme: TerminalThemeChoice::default(),
@@ -726,6 +758,28 @@ mod tests {
     }
 
     #[test]
+    fn host_prompts_default_to_true_and_only_opt_out_is_saved() {
+        let original = serde_json::json!({
+            "label": "test", "endpoint": "https://rex.example", "collapsed": false
+        });
+        let mut host: Host = serde_json::from_value(original.clone()).unwrap();
+        assert!(host.prompts);
+        assert!(!host.remote_control);
+        assert_eq!(serde_json::to_value(&host).unwrap(), original);
+
+        host.prompts = false;
+        let persisted = serde_json::to_value(&host).unwrap();
+        assert_eq!(persisted["prompts"], false);
+        assert!(!serde_json::from_value::<Host>(persisted).unwrap().prompts);
+
+        let mut explicit_true = original.clone();
+        explicit_true["prompts"] = true.into();
+        let host: Host = serde_json::from_value(explicit_true).unwrap();
+        assert!(host.prompts);
+        assert_eq!(serde_json::to_value(host).unwrap(), original);
+    }
+
+    #[test]
     fn updates_check_defaults_to_true_and_round_trips() {
         let old: Settings = serde_json::from_str("{}").unwrap();
         assert!(old.updates.check);
@@ -820,5 +874,39 @@ mod tests {
             endpoint_label("unix:///tmp/rex.sock"),
             "unix:///tmp/rex.sock"
         );
+    }
+
+    #[test]
+    fn shared_host_settings_default_omit_and_round_trip() {
+        let old: Settings =
+            serde_json::from_str(r#"{"hosts":[{"label":"a","endpoint":"unix:///run/rex.sock"}]}"#)
+                .unwrap();
+        assert!(old.sync_shared_hosts);
+        assert_eq!(old.hosts[0].shared, None);
+        let default_json = serde_json::to_value(&old).unwrap();
+        assert!(
+            default_json.get("sync_shared_hosts").is_none(),
+            "sync_shared_hosts is omitted when default true"
+        );
+        assert!(
+            default_json["hosts"][0].get("shared").is_none(),
+            "shared link is omitted when None"
+        );
+
+        let mut modified = old;
+        modified.sync_shared_hosts = false;
+        modified.hosts[0].shared = Some(SharedLink {
+            id: "host:0199abcd-1234-7abc-8def-0123456789ab".into(),
+            from: "unix:///run/user/1000/rex/server.sock".into(),
+        });
+        let saved = serde_json::to_value(&modified).unwrap();
+        assert_eq!(saved["sync_shared_hosts"], false);
+        assert_eq!(
+            saved["hosts"][0]["shared"]["id"],
+            "host:0199abcd-1234-7abc-8def-0123456789ab"
+        );
+        let back: Settings = serde_json::from_value(saved).unwrap();
+        assert!(!back.sync_shared_hosts);
+        assert_eq!(back.hosts[0].shared, modified.hosts[0].shared);
     }
 }

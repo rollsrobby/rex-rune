@@ -1,6 +1,6 @@
 [package]
 name = "rex-rune"
-version = "0.10.1"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -101,6 +101,10 @@ name = "rex-download-probe"
 path = "src/bin/download_probe.rs"
 
 [[bin]]
+name = "rex-install-probe"
+path = "src/bin/install_probe.rs"
+
+[[bin]]
 name = "rex-update-probe"
 path = "src/bin/update_probe.rs"
 
@@ -110,7 +114,7 @@ rune = { path = "vendor/rune/crates/rune" }
 rune-motion = { path = "vendor/rune/crates/rune-motion" }
 rune-staging = { path = "vendor/rune/crates/rune-staging" }
 
-# Revision-13 generated types and explicit negotiation range (vendor/rexrs/REX-RUNE.md).
+# Revision-21 generated types and explicit negotiation range (vendor/rexrs/REX-RUNE.md).
 [patch."https://github.com/a10y/rexrs"]
 rexrs = { path = "vendor/rexrs" }
 
