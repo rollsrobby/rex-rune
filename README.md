@@ -72,6 +72,11 @@ client, launcher and icons, never the `rex` server.
   bind address. Ctrl+Enter (Cmd+Enter on macOS) opens supported ports on Unix-socket
   hosts or copies an `ssh -L` command for SSH hosts.
   [Scope and limits](docs/parity-2026-11/listening-ports.md#slice-2-ui).
+- **Program resume.** **Show program resume…** in Commands lists reported
+  programs by pane (API 24); the pane menu puts that pane first. On Rex snapshot
+  2670 with restore enabled, the server resumes trusted chosen programs after
+  restart. Rex Rune shows metadata and trust reasons, never launch arguments.
+  [Scope and limits](docs/parity-2026-11/program-resume.md).
 - **Fonts and themes.** Chrome palettes, terminal themes declared to the server
   including Ghostty files, installed fonts with a picker and ordered fallbacks,
   bundled IBM Plex Mono and Symbols Nerd Font, font size and live metrics.
@@ -172,6 +177,9 @@ patches are in [Building and development](docs/building.md). The code layout,
 conventions and platform boundary rules are in [AGENTS.md](AGENTS.md). Release
 signing and verification are in [Publishing a binary release](docs/releases.md).
 
+The Rune toolkit is pinned to `983e33b9`. See [the vendoring notes](vendor/rune/README.md)
+for the Linux fixes Rex Rune still carries and the release tooling features it enables.
+
 ## Documentation
 
 - [Docs index](docs/README.md) — every document and verification record.
@@ -212,7 +220,10 @@ details are in [Building and
 development](docs/building.md#vendored-dependencies).
 
 Thanks to [Superlogical Rex](https://www.superlogical.com/rex) for the server
-and protocol this client follows (API revision 21, with revisions 10-20 also
+and protocol this client follows (API revision 24, with revisions 10-23 also
 supported), and to [m4nik1/rex-linux-client](https://github.com/m4nik1/rex-linux-client)
 and [noahdunnagan/rmx](https://github.com/noahdunnagan/rmx) for protocol work
 that served as references.
+
+See [the API 24 compatibility record](docs/server-api24.md) for the tested
+Rex snapshots and their restart behavior.

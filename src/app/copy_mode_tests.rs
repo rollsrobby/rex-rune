@@ -211,10 +211,14 @@ fn copy_runtime(
     ws: Workspace,
     size: (f32, f32),
 ) -> (Runtime<Workspace>, rune::clipboard::MemoryClipboard) {
-    let mut rt = App::new(AppSpec::new("Rex", size, placeholder, view))
-        .init(move || ws)
-        .on_ime(crate::app::input::on_ime)
-        .headless_runtime(size, Env::new(true, 1.));
+    let mut rt = App::new(AppSpec {
+        fonts: rune_theme_opencode::FONTS,
+        families: crate::app::fonts::TEST_FAMILIES,
+        ..AppSpec::new("Rex", size, placeholder, view)
+    })
+    .init(move || ws)
+    .on_ime(crate::app::input::on_ime)
+    .headless_runtime(size, Env::new(true, 1.));
     rt.on_key = Some(crate::app::input::on_key);
     let clipboard = rune::clipboard::memory();
     rt.use_clipboard(&clipboard);
@@ -242,6 +246,8 @@ fn send_key(
                 mods: ev.mods,
                 pressed: down,
                 repeat,
+                text: None,
+                consumed_mods: Mods::default(),
             },
             ev,
             None,
@@ -529,13 +535,14 @@ fn zero_pty_leaks_across_all_copy_mode_states_and_input_paths() {
             tap_text(&mut rt, ch);
         }
         tap_key(&mut rt, Code::Backspace, Key::Backspace);
-        send_key(
-            &mut rt,
-            None,
-            key_ev(Key::Dead(Some('^')), Mods::default()),
-            true,
-            false,
-        );
+        rt.physical_input(PhysicalInput::Key {
+            key: Code::BracketRight,
+            mods: Mods::default(),
+            pressed: true,
+            repeat: false,
+            text: None,
+            consumed_mods: Mods::default(),
+        });
         send_key(
             &mut rt,
             Some(Code::ShiftLeft),
@@ -569,7 +576,7 @@ fn zero_pty_leaks_across_all_copy_mode_states_and_input_paths() {
             tap_key(&mut rt, Code::Enter, Key::Enter);
         }
         // IME Preedit + Commit must be swallowed with zero Command::Paste.
-        rt.ime(Ime::Preedit("漢字".into(), None));
+        rt.ime(Ime::Preedit("漢字".into(), None, vec![]));
         rt.ime(Ime::Commit("漢字".into()));
         rt.frame(1. / 60.);
         assert!(
@@ -1551,7 +1558,7 @@ fn copy_mode_draw() {
         let (sender, sent) = flume::unbounded();
         let mut harness = Harness::new(56, rows, "block:a", output);
         harness.attach(&mut ws, &sender);
-        let mut rt = Runtime::new(ws, view, size, Env::new(true, 2.));
+        let mut rt = crate::app::fonts::test_runtime(ws, view, size, Env::new(true, 2.));
         rt.on_key = Some(crate::app::input::on_key);
         for _ in 0..12 {
             rt.frame(1. / 60.);

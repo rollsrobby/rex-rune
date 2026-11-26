@@ -2,9 +2,16 @@
 
 ## Unreleased
 
+## 0.13.0 - 2026-11-25
+
+Rex Server API revision 24 support (`0.1.0-snapshot.2670`) with read-only OSC 7577 Program Resume inspection, interactive `rex.ui` script prompts (`#144`), API 20 Undo close, API 15 listening TCP ports, API 19 server-side focus history, upstream Rune `983e33b9` upgrade, pipelined high-latency terminal input (`#179`), opt-in render-only local echo (`#180`), and throttled hidden-tab title redraws (`#181`).
+
 ### Added
 
-- **Last session** in Commands toggles between the last two visited sessions, including across hosts, without restoring an old tab. Bind `client.session.last` in Settings → Shortcuts; no default shortcut is assigned.
+- **Program resume (Rex Server API 24).** Open **Show program resume…** in Commands or **Program resume…** in the pane menu to see reported programs, Rex's chosen record, and trust reasons. Snapshot 2670 resumes trusted chosen programs with server restore enabled. The view never shows, copies or runs launch arguments.
+
+- **Local echo** in Settings → Terminal can show pending keystrokes on slow links after the terminal echoes ordinary text. It defaults to Off. Thanks to @johnknott (#180).
+
 - **Focus history (Rex Server API 19+).** Step back through server-side focus history across panes, tabs, and sessions via **Previous focus**, **Previous focused pane in tab**, **Previous focused tab**, and **Previous focused session** in Commands (backed by `focus_history.reverse`). Consecutive keybinding presses of the same scope walk deeper through history using the server's cursor; any other input, navigation, or panel (including opening Commands) resets the walk so the next invocation toggles between the two most recent focuses. `client.focus_history.reverse` is local-only (`Remote::Never`), unbound by default, and supports optional `scope` arguments (`any`, `pane`, `tab`, `tab_any_session`, `session`) in keymaps and Settings -> Shortcuts. Passive refreshes of already-attached sessions use `session.attach` on API 19+ so they do not record focus (avoiding focus-history overwrites from background pane exits or idle clients on attached sessions), while unattached background sweeps keep using `session.view` so Rex Rune never joins unopened sessions. Existing local Back/Forward navigation (`client.history.back` / `client.history.forward`) is unchanged.
 
 - **Listening ports (Rex Server API 15+).** Find listening TCP ports in the current session from Commands or the pane menu. Copy an address anywhere, open a local port, or copy an SSH forwarding command without running it.
@@ -13,9 +20,21 @@
 
 - **Interactive `rex.ui` script prompts (Closes [#144](https://github.com/shuv1337/rex-rune/issues/144)).** Completes `rex.ui` support (API 17+) across both `input` and `pick` (single, multiple, and `allow_other`) prompts. Adds an arrival-ordered prompt queue per host with calm auto-open rules (never clobbering open local dialogs, waiting during active typing unless triggered by this client's own in-flight `client.action`, and respecting a 10-second per-host post-cancel cool-down), demotion draft preservation, and a 300 ms accidental-submit guard plus Enter repeat suppression. Renders an anti-spoofing modal over a persistent dark scrim (clicking outside does nothing; Escape/Cancel ends the prompt) with client-owned `Question from <saved host label>` attribution, medium 15 pt script title, mono action subline, destination footnote, 16 authored 20x20 stroke icons plus generic fallback, 4,096-character input cap, inline `bad_request` rejection errors without losing drafts, and 640x480 minimum-window fit. Adds a `WARNING` waiting toolbar chip (`Question · <host>` / `<N> questions`, floating when the toolbar is hidden), a Commands entry (`Answer question from <host>…`), a per-host **Allow script prompts** switch in Settings -> Remote Hosts (default on, opt-out persisted in `settings::Host.prompts`), and zero-PTY-leak input guards. [Scope, captures, and live X11 checks](docs/parity-2026-11/rex-ui.md).
 
+### Changed
+
+- Negotiates Rex Server API revisions 10 through 24 and refreshes the SDK capture from snapshot 2670. [Compatibility record](docs/server-api24.md).
+
+- Terminal input no longer waits a round trip per keystroke on slow links. Adjacent resizes and matching mouse motions coalesce, and multi-pane metadata and themes load in batches. Thanks to @johnknott (#179).
+
+- Upgraded Rune to `983e33b9`. The client now uses Rune's native window chrome, keyboard, IME, and system font APIs, including the X11 window menu. Release builds still include screenshot and acceptance scripting tools.
+
 ### Fixed
 
+- Animated terminal titles no longer redraw the workspace on every change. Switching tabs or hosts still shows the latest title immediately. [#181](https://github.com/shuv1337/rex-rune/issues/181), reported by @samth.
+
 - **Lua actions no longer stall their own prompt.** The control worker keeps listening for `rex.ui` while `client.action` is pending, so it can decline or answer immediately and still apply the action's eventual response.
+
+- Cached session view labels stay in sync with `session.list` even if a rename event is dropped. Unix socket and SSH agent probes report clearer messages instead of raw OS errors ([#170](https://github.com/shuv1337/rex-rune/pull/170)).
 
 ## 0.12.0 - 2026-11-24
 

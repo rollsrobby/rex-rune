@@ -90,6 +90,7 @@ fn only_the_outer_corners_of_a_selection_of_several_rows_are_round() {
 fn cells(text: &str) -> Vec<Cell> {
     text.chars()
         .map(|ch| Cell {
+            explicit_bg: false,
             text: ch.to_string(),
             spacer_tail: false,
             fg: if ch.is_ascii_uppercase() {
@@ -146,7 +147,7 @@ fn row_view(s: &RowState, _: &mut rune::Cx<RowState>) -> El {
 /// The fills a row draws for the selection of its cells 1 to 6, left to right: (first
 /// column, columns, radii) and the fill itself.
 fn fills(colors: TermColors, corners: [bool; 4]) -> Vec<(Drawn, [f32; 4])> {
-    let mut rt = rune::Runtime::new(
+    let mut rt = crate::app::fonts::test_runtime(
         RowState {
             cells: cells("ab CD ef"),
             corners,
@@ -219,7 +220,7 @@ fn wide_selected_cells_share_fill_and_leave_original_cells_unchanged() {
                 &s.1,
             )
         };
-        let mut rt = rune::Runtime::new(
+        let mut rt = crate::app::fonts::test_runtime(
             (original.clone(), look),
             view,
             (200., 100.),

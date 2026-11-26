@@ -13,6 +13,8 @@ mod fetch_view_tests;
 mod focus_history_tests;
 #[path = "hosts_tests.rs"]
 mod hosts_tests;
+#[path = "input_tests.rs"]
+mod input_tests;
 #[path = "keymap_tests.rs"]
 mod keymap_tests;
 #[path = "navigation_tests.rs"]
@@ -21,6 +23,8 @@ mod navigation_tests;
 mod perform_tests;
 #[path = "ports_tests.rs"]
 mod ports_tests;
+#[path = "program_resume_tests.rs"]
+mod program_resume_tests;
 #[path = "prompt_wire_tests.rs"]
 mod prompt_wire_tests;
 #[path = "server_controls_tests.rs"]
@@ -32,6 +36,8 @@ mod server_info_tests;
 mod ssh_agent_tests;
 #[path = "status_sweep_tests.rs"]
 mod status_sweep_tests;
+#[path = "title_wake_tests.rs"]
+mod title_wake_tests;
 #[path = "undo_close_tests.rs"]
 mod undo_close_tests;
 #[path = "verb_tests.rs"]
@@ -183,7 +189,7 @@ async fn send(ws: &mut WebSocketStream<TcpStream>, value: Value) {
 
 async fn welcome(ws: &mut WebSocketStream<TcpStream>, revision: u32) -> Value {
     let hello = recv(ws).await;
-    assert_eq!(hello["api_revision"], 21);
+    assert_eq!(hello["api_revision"], 24);
     assert_eq!(hello["api_min_revision"], 10);
     send(ws, json!({"type":"welcome", "protocol":"rex.control.v1", "api_revision":revision,
         "limits":{"max_message_bytes":65536}, "client":{"id":"client:test", "reconnect_token":"test-token"}})).await;
@@ -261,7 +267,7 @@ async fn bootstrap_is_first_and_newer_pre_response_events_survive() {
 
 #[tokio::test]
 async fn unsupported_negotiated_revision_is_rejected() {
-    for revision in [9, 22] {
+    for revision in [9, 25] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -271,7 +277,7 @@ async fn unsupported_negotiated_revision_is_rejected() {
         let error = transport::control(&endpoint, None).await.err().unwrap();
         assert_eq!(
             error.to_string(),
-            format!("Rex negotiated API revision {revision}; this client supports 10–21")
+            format!("Rex negotiated API revision {revision}; this client supports 10–24")
         );
         server.await.unwrap();
     }
@@ -279,7 +285,7 @@ async fn unsupported_negotiated_revision_is_rejected() {
 
 #[tokio::test]
 async fn supported_revisions_negotiate() {
-    for revision in 10..=21 {
+    for revision in 10..=24 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -2046,7 +2052,7 @@ async fn copy_mode_worker_round_trip_yank_generation_guard_and_auto_exit() {
     let pane = PaneShared {
         model: model.clone(),
         wake: wake_tx,
-        host_wake: host_wake_tx,
+        host_wake: title_wake::HostWake::new(host_wake_tx),
     };
 
     async fn wait_for(
@@ -2319,7 +2325,7 @@ async fn copy_mode_and_pointer_selection_coordinate_without_clobber_or_orphans()
     let pane = PaneShared {
         model: model.clone(),
         wake: wake_tx,
-        host_wake: host_wake_tx,
+        host_wake: title_wake::HostWake::new(host_wake_tx),
     };
 
     async fn wait_for(
@@ -2548,7 +2554,7 @@ async fn copy_mode_search_to_match_and_steps_settle_when_queued_without_pre_tick
     let pane = PaneShared {
         model: model.clone(),
         wake: wake_tx,
-        host_wake: host_wake_tx,
+        host_wake: title_wake::HostWake::new(host_wake_tx),
     };
 
     async fn wait_for(
@@ -2777,7 +2783,7 @@ async fn search_step_with_copy_mode_off_is_never_dropped_while_unsettled() {
     let pane = PaneShared {
         model: model.clone(),
         wake: wake_tx,
-        host_wake: host_wake_tx,
+        host_wake: title_wake::HostWake::new(host_wake_tx),
     };
 
     async fn wait_for(

@@ -52,7 +52,10 @@ fn dispatch(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, global_only: bool) ->
         session: s.model().selected.clone(),
         pane: s.focused_block(),
         panel: s.panel.is_some(),
-        focus: tx.focused().map(str::to_owned),
+        focus: tx
+            .focused()
+            .filter(|key| *key != TERMINAL_FOCUS)
+            .map(str::to_owned),
         generation: s.keymap_generation,
         server_revision: s.model().keymap_revision,
         connected: s.model().connected,
@@ -323,6 +326,45 @@ pub fn rename_key(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 
+pub const TERMINAL_FOCUS: &str = "window";
+
+/// Leave a key passed by the terminal focus handler to the system, not a second dispatch.
+pub fn on_window_key(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    tx.focused() != Some(TERMINAL_FOCUS) && on_key(s, ev, tx)
+}
+
+pub fn on_physical_input(s: &mut Workspace, event: &rune::PhysicalInput, _: &mut Tx) -> bool {
+    use rune::PhysicalInput;
+    match event {
+        PhysicalInput::Key {
+            key,
+            mods,
+            pressed,
+            consumed_mods,
+            ..
+        } => {
+            use rune::PhysicalKeyCode as Code;
+            match key {
+                Code::AltLeft => s.held_option.left = *pressed,
+                Code::AltRight => s.held_option.right = *pressed,
+                _ if !mods.alt => s.held_option = Default::default(),
+                _ => {}
+            }
+            // Rune compares against the unmodified key. Shift+Alt that types "B"
+            // instead of "b" can therefore report Alt as consumed even on the Alt side.
+            s.composed_option =
+                (*pressed && consumed_mods.alt && s.option_composes()).then_some(*key);
+        }
+        PhysicalInput::FocusLost => {
+            s.held_option = Default::default();
+            s.composed_option = None;
+        }
+        PhysicalInput::Modifiers(mods) if !mods.alt => s.held_option = Default::default(),
+        PhysicalInput::Modifiers(_) => {}
+    }
+    false
+}
+
 pub fn on_key(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if s.recording().is_some() {
         return super::recorder::key(s, ev, tx);
@@ -391,10 +433,10 @@ fn forward(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, prefix: Vec<String>) -
     .identity();
     // A repeat reaches the PTY only when its press did: a key held across an automatic
     // copy-mode exit (or popup/dialog close) must never leak repeats to the PTY.
-    if repeat && !s.forwarded.contains(&identity) {
+    if repeat && !s.forwarded.contains_key(&identity) {
         return true;
     }
-    if tx.focused().is_some() {
+    if tx.focused().is_some_and(|key| key != TERMINAL_FOCUS) {
         // Both unbound keys and explicit forward bindings return focus to the terminal.
         tx.blur();
     }
@@ -403,7 +445,11 @@ fn forward(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, prefix: Vec<String>) -
     } else {
         Action::Press
     };
-    let composes = s.option_composes(tx.alt_keys());
+    let composes = s.option_choice
+        && tx.focused() == Some(TERMINAL_FOCUS)
+        && code.is_some()
+        && s.composed_option.take() == code
+        && keys::is_option_text(ev);
     let payload = keys::payload(ev, code, base, action);
     if payload.is_some() {
         s.clear_focus_history_walk();
@@ -417,7 +463,7 @@ fn forward(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, prefix: Vec<String>) -
     term.clear_selection();
     if let Some(mut payload) = payload {
         if composes {
-            keys::option_composed(&mut payload, ev);
+            keys::option_composed(&mut payload);
         }
         term.send(if prefix.is_empty() {
             Command::Key(payload)
@@ -428,7 +474,9 @@ fn forward(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx, prefix: Vec<String>) -
             }
         });
         s.last_keypress = Some(std::time::Instant::now());
-        s.forwarded.insert(identity);
+        if !repeat {
+            s.forwarded.insert(identity, composes);
+        }
     }
     true
 }
@@ -446,20 +494,19 @@ pub fn on_key_up(s: &mut Workspace, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     .identity();
     let consumed = s.bindings.consumed.remove(&identity).is_some();
-    if s.is_prompt_open() || s.ports_target().is_some() {
+    if s.is_prompt_open() || s.session_inspector_open() {
         s.forwarded.remove(&identity);
         return true;
     }
-    if !s.forwarded.remove(&identity) {
+    let Some(composed) = s.forwarded.remove(&identity) else {
         return consumed || s.in_copy_mode() || s.panel.is_none();
-    }
-    let composes = s.option_composes(tx.alt_keys());
+    };
     if let Some(term) = s.active_terminal_mut()
         && term.status().live
         && let Some(mut payload) = keys::payload(ev, code, base, Action::Release)
     {
-        if composes {
-            keys::option_composed(&mut payload, ev);
+        if composed {
+            keys::option_composed(&mut payload);
         }
         term.send(Command::Key(payload));
     }
@@ -482,8 +529,11 @@ pub fn on_ime(s: &mut Workspace, ime: &Ime, _: &mut Tx) -> bool {
     let Some(term) = s.active_terminal_mut() else {
         return false;
     };
+    if matches!(ime, Ime::Preedit(..) | Ime::Commit(_) | Ime::Disabled) {
+        term.clear_local_echo();
+    }
     match ime {
-        Ime::Preedit(text, _) => {
+        Ime::Preedit(text, ..) => {
             term.preedit = text.clone();
             if !text.is_empty() {
                 s.clear_focus_history_walk();
@@ -498,7 +548,7 @@ pub fn on_ime(s: &mut Workspace, ime: &Ime, _: &mut Tx) -> bool {
             }
         }
         Ime::Disabled => term.preedit.clear(),
-        Ime::Enabled => {}
+        Ime::Enabled | Ime::Select(_) => {}
     }
     true
 }

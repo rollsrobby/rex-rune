@@ -388,7 +388,7 @@ fn pane_card(
                     .terminal
                     .cursor_force
                     .then(|| s.settings.terminal.cursor_style.shape()),
-                ime: keyboard && !s.copy_mode_on(&key),
+                ime: (keyboard && !s.copy_mode_on(&key)).then(|| s.terminal_option_as_alt()),
                 colors,
             };
             let (k1, k2, k3) = (key.clone(), key.clone(), key.clone());
@@ -405,9 +405,7 @@ fn pane_card(
                         format!("Terminal {name}")
                     }
                 })
-                .grow(1.)
-                .w_full()
-                .min_h(0.)
+                .pin(Some(0.), Some(0.), Some(0.), Some(0.))
                 // A program that tracks the mouse owns the pointer, as in Ghostty; a link under
                 // Ctrl is the exception.
                 .cursor(if t.link.is_some() {
@@ -725,17 +723,10 @@ fn pane_card(
                     edge + (pad_y - edge).max(0.),
                 )
             };
-            let c = c.child(
-                body.grow(1.)
-                    .min_h(0.)
-                    .pt(top)
-                    .instant_changes()
-                    .motion(STILL)
-                    .child(grid),
-            );
-            // The find bar is the card's, not the grid's: it is chrome over a corner of the
-            // terminal, and springs when it changes corner.
-            match &t.search {
+            // The grid and Find share one layout box, but the bar is not a child
+            // of the grid's pointer target and cannot send mouse input to a program.
+            let content = el().grow(1.).w_full().min_h(0.).child(grid);
+            let content = match &t.search {
                 Some(edit) => {
                     let above = if headed { CARD_HEADER + clear } else { 0. } + lead + top;
                     let pane = find::Pane {
@@ -746,19 +737,20 @@ fn pane_card(
                         cell: m.cell,
                         lowered: find::lowered(s, window, block, t),
                     };
-                    c.child(find::apron(block, t, pane, (side, above), fill))
-                        .child(find::bar(
-                            s,
-                            block,
-                            &key,
-                            edit,
-                            t,
-                            pane,
-                            (side, above, foot),
-                        ))
+                    content
+                        .child(find::apron(block, t, pane, fill))
+                        .child(find::bar(s, block, &key, edit, t, pane))
                 }
-                None => c,
-            }
+                None => content,
+            };
+            c.child(
+                body.grow(1.)
+                    .min_h(0.)
+                    .pt(top)
+                    .instant_changes()
+                    .motion(STILL)
+                    .child(content),
+            )
         }
         None => c.child(
             col().grow(1.).center().child(
@@ -791,22 +783,15 @@ fn pane_card(
         Some(strip) => c.child(strip.pin(None, Some(8.), Some(12.), None)),
         None => c,
     };
-    let c = if !headed && !searching && s.settings.pane_header == PaneHeader::OnHover {
-        c.child(pane_header::reveal_band(
-            block,
-            pane_header::clearance(s, rect),
-        ))
+    let top = pane_header::clearance(s, rect);
+    let floating = (placement == Placement::Floating)
+        .then(|| pane_header::floating(header(s, window, block, rect[2], focused, m), !bleed, top));
+    if !headed && !searching && s.settings.pane_header == PaneHeader::OnHover {
+        // A hover band only sees its own target or descendants. The floating
+        // header stays inside it so showing it does not report a hover leave.
+        c.child(pane_header::reveal_band(block, top).children(floating))
     } else {
-        c
-    };
-    if placement == Placement::Floating {
-        c.child(pane_header::floating(
-            header(s, window, block, rect[2], focused, m),
-            !bleed,
-            pane_header::clearance(s, rect),
-        ))
-    } else {
-        c
+        c.children(floating)
     }
 }
 

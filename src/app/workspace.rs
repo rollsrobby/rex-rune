@@ -73,14 +73,15 @@ pub struct Workspace {
     pub terminals: HashMap<(HostId, String), Term>,
     pub panel: Option<Panel>,
     pub(super) ports_watch: Option<super::ports::Watch>,
+    pub(super) program_resume_watch: Option<super::program_resume::Watch>,
     pub notices: Vec<Notice>,
     next_notice: u64,
     zoom_notice: Option<u64>,
     pub drag: Option<DividerDrag>,
     pub layer_drag: Option<super::floating_drag::LayerDrag>,
     pub copy_mode: Option<super::copy_mode::Session>,
-    /// Keys whose press went to a terminal; only their releases follow.
-    pub forwarded: HashSet<super::bindings::Identity>,
+    /// Keys whose press went to a terminal, and whether Option composed that press.
+    pub forwarded: HashMap<super::bindings::Identity, bool>,
     pub bindings: super::bindings::State,
     pub local_keymap: rex_rune::keymap::Resolved,
     pub keymap_generation: u64,
@@ -107,7 +108,7 @@ pub struct Workspace {
     pub title_inset: f32,
     /// The traffic lights are hidden for full screen. Known only where Rex's title row is.
     pub full_screen: bool,
-    /// The window says it is full screen (`Cx::window_full_screen`); read when it resizes or
+    /// The window says it is full screen (`Cx::is_full_screen`); read when it resizes or
     /// its traffic lights move. On X11 the window manager entering or leaving full screen is
     /// not seen: after it takes Rex out of a full screen Rex entered, this stays true until
     /// Rex toggles it again.
@@ -119,9 +120,12 @@ pub struct Workspace {
     pub option_choice: bool,
     /// Whether the layout in use is U.S., read again when the person picks another one.
     pub us_layout: Option<bool>,
-    /// The panes' Option keys, as last asked of Rune (`Tx::set_option_alt`); Rune drops them
-    /// while a field has focus.
-    pub option_as_alt: Option<rune::OptionAsAlt>,
+    /// A physical press whose layout spent Option producing text. The following logical
+    /// press carries the same physical code.
+    pub composed_option: Option<rune::PhysicalKeyCode>,
+    /// Physical Option presses, so Shift+Option can distinguish the configured Alt side
+    /// from the composing side when both modifiers are reported as consumed.
+    pub held_option: OptionSides,
     /// The pane a file drag from another app is over.
     pub drop_hover: Option<String>,
     /// Pane headers brought out by the pointer or by Reveal pane headers.
@@ -291,13 +295,14 @@ impl Workspace {
             terminals: HashMap::new(),
             panel: None,
             ports_watch: None,
+            program_resume_watch: None,
             notices: Vec::new(),
             next_notice: 0,
             zoom_notice: None,
             drag: None,
             layer_drag: None,
             copy_mode: None,
-            forwarded: HashSet::new(),
+            forwarded: HashMap::new(),
             bindings: Default::default(),
             local_keymap,
             keymap_generation: 0,
@@ -315,7 +320,8 @@ impl Workspace {
             unified_title: !cfg!(test) && super::platform::chrome::UNIFIED,
             option_choice: !cfg!(test) && super::platform::keys::OPTION_COMPOSES,
             us_layout: None,
-            option_as_alt: None,
+            composed_option: None,
+            held_option: OptionSides::NEITHER,
             title_inset: 0.,
             full_screen: false,
             window_full_screen: false,
@@ -467,6 +473,9 @@ impl Workspace {
             })
             .expect("host wake thread");
         let model = connection.model.lock().expect("host model").clone();
+        model.rtt.enable(
+            self.settings.terminal.local_echo != rex_rune::settings::terminal::LocalEcho::Off,
+        );
         HostState {
             id,
             connection,
@@ -515,7 +524,7 @@ impl Workspace {
         self.leave_install_dialog();
         self.clear_focus_history_walk();
         self.navigation.cancel();
-        if self.ports_target().is_some() {
+        if self.session_inspector_open() {
             self.close_panel(tx);
         }
         let state = self.hosts.remove(index);
@@ -681,6 +690,7 @@ impl Workspace {
                     .expect("terminal wake thread");
                 let mut term = Term::new(connection.clone());
                 term.set_cursor_style(self.settings.terminal.cursor_style.shape());
+                term.set_local_echo(self.settings.terminal.local_echo);
                 term.cache_images(self.images.as_ref());
                 self.terminals.insert(key, term);
             }
@@ -719,14 +729,31 @@ impl Workspace {
                 &mut std::sync::Arc::make_mut(snapshot).resolved,
             );
         }
+        if self.settings.terminal.local_echo != rex_rune::settings::terminal::LocalEcho::Off {
+            let old = &self.hosts[index].model;
+            let boundary = !model.connected
+                || old.connection_epoch != model.connection_epoch
+                || old.selected != model.selected
+                || old.focused() != model.focused()
+                || old.window().map(|w| &w.window_id) != model.window().map(|w| &w.window_id);
+            for ((host, block), term) in &mut self.terminals {
+                if *host == id
+                    && (boundary
+                        || old.programs.get(block) != model.programs.get(block)
+                        || old.foreground.get(block) != model.foreground.get(block)
+                        || old.titles.get(block) != model.titles.get(block)
+                        || old.executables.get(block) != model.executables.get(block)
+                        || old.scripts.get(block) != model.scripts.get(block))
+                {
+                    term.clear_local_echo();
+                }
+            }
+        }
         self.hosts[index].model = model;
-        if self
-            .ports_target()
-            .is_some_and(|target| !self.ports_in_context(target))
-        {
+        if self.session_inspector_out_of_context() {
             self.close_panel(tx);
         }
-        self.refresh_ports_watch();
+        self.refresh_session_inspector_watches();
         if index == self.active {
             // The session, keymap revision or connection above is what a mode belongs to.
             self.revalidate_key_modes();
@@ -753,6 +780,8 @@ impl Workspace {
                     "Returned client action skipped: only the person at this computer can stop a server."
                 } else if queued.action.action == super::ports::ACTION {
                     "Returned client action skipped: only the person at this computer can show listening ports."
+                } else if queued.action.action == super::program_resume::ACTION {
+                    "Returned client action skipped: only the person at this computer can show program resume."
                 } else if queued.action.action == super::actions::UNDO_CLOSE {
                     "Returned client action skipped: only the person at this computer can undo a close."
                 } else if queued.action.action == super::actions::FOCUS_HISTORY_REVERSE {
@@ -802,6 +831,7 @@ impl Workspace {
         self.restore_activity_selection(activity_selection);
         self.restore_row_selection();
         self.seed_ports_selection();
+        self.seed_program_resume_selection();
         self.deliver_program_notices(index, notices);
         self.sync_layer_menu(tx);
         self.sync_layer_drag();
@@ -880,11 +910,15 @@ impl Workspace {
         } else {
             self.bindings.consumed.clear();
             self.forwarded.clear();
+            self.held_option = OptionSides::NEITHER;
+            self.composed_option = None;
+            self.toolbar_reveal.clear_hover();
         }
         if !focused {
             self.cancel_layer_drag();
             for term in self.terminals.values_mut() {
                 term.end_selection();
+                term.clear_local_echo();
             }
         }
         if focused {
@@ -1200,9 +1234,8 @@ impl Workspace {
         self.full_screen || self.window_full_screen
     }
 
-    /// Asks Rune for the panes' Option when the setting or the layout has changed. Main
-    /// thread only: `layout_changed` reads the layout again.
-    pub fn sync_option_key(&mut self, tx: &mut Tx, layout_changed: bool) {
+    /// Reads and watches the layout on the main thread for the Automatic setting.
+    pub fn sync_option_layout(&mut self) {
         if !self.option_choice {
             return;
         }
@@ -1210,39 +1243,39 @@ impl Workspace {
         if self.us_layout.is_none() && !cfg!(test) {
             let handle = self.handle.clone();
             super::platform::keys::watch_layout(move || {
-                handle.update(|s, tx| s.sync_option_key(tx, true));
+                handle.update(|s, _| s.us_layout = Some(super::platform::keys::us_layout()));
             });
         }
-        if (layout_changed && !cfg!(test)) || self.us_layout.is_none() {
+        if self.us_layout.is_none() {
             self.us_layout = Some(cfg!(test) || super::platform::keys::us_layout());
         }
-        // Rune keeps Option's characters for whichever of Rex's own fields has focus (@ in an
-        // address, é in a search), so this is the panes' Option.
-        let alt = match self.option_sides() {
+    }
+
+    pub fn terminal_option_as_alt(&self) -> rune::OptionAsAlt {
+        if !self.option_choice {
+            return rune::OptionAsAlt::None;
+        }
+        match self
+            .settings
+            .terminal
+            .option_key
+            .alt_sides(self.us_layout != Some(false))
+        {
             OptionSides::BOTH => rune::OptionAsAlt::Both,
             OptionSides::LEFT => rune::OptionAsAlt::Left,
             OptionSides::RIGHT => rune::OptionAsAlt::Right,
-            _ => rune::OptionAsAlt::Neither,
-        };
-        if self.option_as_alt != Some(alt) {
-            tx.set_option_alt(alt);
-            self.option_as_alt = Some(alt);
+            _ => rune::OptionAsAlt::None,
         }
     }
 
-    /// The Option keys Terminal settings make Alt with the layout in use.
-    fn option_sides(&self) -> OptionSides {
-        (self.settings.terminal.option_key).alt_sides(self.us_layout != Some(false))
-    }
-
-    /// Whether Option composes the text of a key typed with the `held` Option keys
-    /// (`Tx::alt_keys`), which the program then gets without Alt.
-    pub fn option_composes(&self, held: rune::AltKeys) -> bool {
-        let held = OptionSides {
-            left: held.left,
-            right: held.right,
-        };
-        self.option_choice && !self.option_sides().alt_with(held)
+    pub fn option_composes(&self) -> bool {
+        self.option_choice
+            && !self
+                .settings
+                .terminal
+                .option_key
+                .alt_sides(self.us_layout != Some(false))
+                .alt_with(self.held_option)
     }
 
     /// A drag writes preferences once, after the window has kept its size for a second.
@@ -1316,6 +1349,7 @@ impl Workspace {
             return;
         }
         if let Some(term) = self.active_terminal_mut() {
+            term.clear_local_echo();
             term.search.get_or_insert_with(|| TextEdit::new("")).focused = true;
         }
     }
@@ -1535,13 +1569,11 @@ impl Workspace {
     /// back a mode nobody entered again.
     pub fn update_visibility(&mut self) {
         self.revalidate_key_modes();
-        if self
-            .ports_target()
-            .is_some_and(|target| !self.ports_in_context(target))
-        {
+        if self.session_inspector_out_of_context() {
             self.cancel_panel_quiet();
         }
         for term in self.terminals.values_mut() {
+            term.clear_local_echo();
             term.end_selection();
         }
         for index in 0..self.hosts.len() {
@@ -1593,6 +1625,7 @@ impl Workspace {
             && !matches!(
                 action,
                 Intent::Port(_)
+                    | Intent::InspectProgramResume
                     | Intent::Theme(_)
                     | Intent::Chrome(_)
                     | Intent::SshAgent(_)
@@ -1624,6 +1657,7 @@ impl Workspace {
             Intent::Select(host, id) => self.select(host, id, tx),
             Intent::ActivityTab(target) => self.choose_activity(target, tx),
             Intent::Port(key) => self.use_port(&key, false, tx),
+            Intent::InspectProgramResume => {}
             Intent::Tab(id) => {
                 if let Some(session) = self.model().selected.clone() {
                     self.select_window(self.active, session, id, tx);
@@ -1792,7 +1826,7 @@ impl Workspace {
                 let back = self.panel.take();
                 self.panel = Some(Panel::new(PanelKind::Settings, "Settings", &[]));
                 self.panel.as_mut().unwrap().target = back.and_then(|p| p.target);
-                self.refresh_ports_watch();
+                self.refresh_session_inspector_watches();
                 if self.settings_section == SettingsSection::Notifications {
                     self.notification_command(super::notify::Command::Check);
                     self.sound_request(super::sounds::Request::Check);
@@ -2194,6 +2228,7 @@ impl Workspace {
             | PaneAction::SelectAll
             | PaneAction::CopyId
             | PaneAction::Ports
+            | PaneAction::ProgramResume
             | PaneAction::Clear
             | PaneAction::Reset => self.pane_verb(target, action, tx),
         }
@@ -2253,7 +2288,7 @@ impl Workspace {
                 Box::new(p)
             });
         self.panel = Some(panel);
-        self.refresh_ports_watch();
+        self.refresh_session_inspector_watches();
         self.reconcile_prompts();
     }
 
@@ -2290,6 +2325,7 @@ impl Workspace {
         self.leave_install_dialog();
         self.bindings.sequence.clear();
         for term in self.terminals.values_mut() {
+            term.clear_local_echo();
             term.end_selection();
         }
         let previous = self.panel.take();
@@ -2336,13 +2372,13 @@ impl Workspace {
         };
         self.panel = Some(panel);
         if let Some(first) = self.entries().iter().position(|e| e.enabled) {
-            if self.ports_target().is_some() {
+            if self.session_inspector_open() {
                 self.select_row(first);
             } else {
                 self.panel.as_mut().unwrap().selected = first;
             }
         }
-        self.refresh_ports_watch();
+        self.refresh_session_inspector_watches();
         self.reconcile_prompts();
     }
 
@@ -2394,7 +2430,7 @@ impl Workspace {
         self.leave_download_dialog();
         self.bindings.sequence.clear();
         self.panel = None;
-        self.refresh_ports_watch();
+        self.refresh_session_inspector_watches();
         self.reconcile_prompts();
         tx.blur();
     }
@@ -2418,7 +2454,7 @@ impl Workspace {
         } else {
             self.panel = None;
         }
-        self.refresh_ports_watch();
+        self.refresh_session_inspector_watches();
         self.reconcile_prompts();
     }
 
@@ -2437,7 +2473,7 @@ impl Workspace {
                 input.focused = true;
             }
             self.panel = Some(*back);
-            self.refresh_ports_watch();
+            self.refresh_session_inspector_watches();
             self.reconcile_prompts();
         } else {
             self.close_panel(tx);
@@ -2446,7 +2482,7 @@ impl Workspace {
 
     pub fn navigate_panel(&mut self, delta: isize) {
         let entries = self.entries();
-        if self.ports_target().is_some()
+        if self.session_inspector_open()
             && let Some((_, id)) = self.panel.as_ref().and_then(|p| p.row.as_ref())
             && !entries.iter().any(|e| e.id.as_deref() == Some(id))
         {
@@ -2538,6 +2574,9 @@ impl Workspace {
     }
 
     pub fn submit(&mut self, tx: &mut Tx) {
+        if self.program_resume_target().is_some() {
+            return;
+        }
         if self.ports_target().is_some() {
             self.submit_port(false, tx);
             return;

@@ -55,7 +55,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "rex-rune";
-  version = "0.12.0";
+  version = "0.13.0";
   src = lib.cleanSourceWith {
     src = lib.cleanSource ../.;
     # Keep local build trees out of `path:` builds.
@@ -72,7 +72,8 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../Cargo.lock;
     outputHashes = {
-      "rune-kit-0.0.1" = "sha256-IWvwANCYSmgeI9ZZ/X0YYFeJaSKSr2CYnQSsZyJgB1c=";
+      # All Rune git packages, including the registry patches, share this checkout.
+      "rune-kit-0.0.1" = "sha256-rlDi4WiUnCvOU4x32O0Qb20cdiXbljnjNAFjn3UMCwM=";
     };
   };
   nativeBuildInputs = [

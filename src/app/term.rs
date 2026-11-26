@@ -12,12 +12,13 @@ use rex_rune::{
     connection::{Command, Connection},
     links::Link,
     settings::{
-        terminal::{SelectionColor, TerminalConfig},
+        terminal::{LocalEcho, SelectionColor, TerminalConfig},
         typography::Typography,
     },
     terminal::{
         Cell, CopyModeOp, CopyYank, CursorShape, Frame, SelectionUnit,
         graphics::{Image as TermImage, ImagePixels},
+        local_echo,
     },
     terminal_theme::{TerminalTheme, is_light},
 };
@@ -88,8 +89,16 @@ pub struct Term {
     pending_copy_yank: Option<CopyYank>,
     /// Last delivered `(epoch, revision)` so each yank is copied at most once.
     last_copy_yank: Option<(u64, u64)>,
-    /// Defense-in-depth: a script prompt or Ports can block direct PTY input commands.
+    /// Defense-in-depth: a script prompt or session inspector can block direct PTY input.
     pub panel_blocks_input: bool,
+    /// Opt-in Mosh-style speculative local echo state (render-only overlay).
+    local_echo: local_echo::Predictor,
+    local_echo_mode: LocalEcho,
+    echo_stream_epoch: u64,
+    #[cfg(test)]
+    pub(super) echo_test_latency: Option<u32>,
+    #[cfg(test)]
+    pub(super) echo_test_clock: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -281,11 +290,83 @@ impl Term {
             pending_copy_yank: None,
             last_copy_yank: None,
             panel_blocks_input: false,
+            local_echo: local_echo::Predictor::default(),
+            local_echo_mode: LocalEcho::Off,
+            echo_stream_epoch: 0,
+            #[cfg(test)]
+            echo_test_latency: None,
+            #[cfg(test)]
+            echo_test_clock: None,
         }
     }
 
+    pub fn set_local_echo(&mut self, mode: LocalEcho) {
+        if self.local_echo_mode != mode {
+            self.local_echo_mode = mode;
+            let model = self.connection.model.lock().expect("terminal model");
+            if self.echo_stream_epoch != model.stream_epoch {
+                self.local_echo.reset();
+                self.echo_stream_epoch = model.stream_epoch;
+            }
+            self.local_echo.interrupt(
+                model
+                    .frame
+                    .as_deref()
+                    .filter(|f| f.stream_epoch == model.stream_epoch),
+            );
+        }
+    }
+
+    pub fn clear_local_echo(&mut self) -> bool {
+        let visible = self.local_echo.potentially_visible();
+        if self.local_echo_mode != LocalEcho::Off {
+            let model = self.connection.model.lock().expect("terminal model");
+            self.local_echo.interrupt(model.frame.as_deref());
+        }
+        visible
+    }
+
+    fn echo_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.echo_test_clock {
+            return now;
+        }
+        Instant::now()
+    }
+
+    fn measured_latency(&self, model: &rex_rune::connection::Model) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(ms) = self.echo_test_latency {
+            return Some(ms.min(5000));
+        }
+        model.rtt.ms()
+    }
+
+    // Do not render or enqueue against a frame whose replacement is waiting on the UI wake.
+    fn echo_latency(&self) -> Option<Option<u32>> {
+        let m = self.connection.model.lock().expect("terminal model");
+        (m.control_connected
+            && m.connected
+            && self.echo_stream_epoch == m.stream_epoch
+            && self
+                .frame
+                .as_ref()
+                .zip(m.frame.as_ref())
+                .is_some_and(|(a, b)| a.stream_epoch == m.stream_epoch && Arc::ptr_eq(a, b)))
+        .then(|| self.measured_latency(&m))
+    }
+
+    pub fn poll_local_echo(&mut self, now: Instant) -> (bool, Option<Instant>) {
+        let Some(rtt) = self.echo_latency() else {
+            let changed = self.local_echo.has_pending();
+            self.clear_local_echo();
+            return (changed, None);
+        };
+        self.local_echo.poll(self.local_echo_mode, rtt, now)
+    }
+
     pub fn refresh(&mut self) {
-        let (frame, generation, notice, copy_yank, copy_ended_epoch) = {
+        let (frame, generation, notice, copy_yank, copy_ended_epoch, stream_epoch, live) = {
             let mut model = self.connection.model.lock().expect("terminal model");
             (
                 model.frame.clone(),
@@ -293,6 +374,8 @@ impl Term {
                 model.notice.take(),
                 model.copy_yank.take(),
                 model.copy_ended_epoch,
+                model.stream_epoch,
+                model.connected && model.control_connected,
             )
         };
         if notice.is_some() {
@@ -338,6 +421,22 @@ impl Term {
                 } else if !self.selecting && frame.selection_text.is_none() {
                     self.selection = None;
                 }
+            }
+        }
+        if self.local_echo_mode != LocalEcho::Off {
+            if self.echo_stream_epoch != stream_epoch {
+                self.local_echo.reset();
+                self.echo_stream_epoch = stream_epoch;
+            } else if !live || frame.is_none() {
+                self.local_echo.interrupt(None);
+            } else if let (Some(prev), Some(next)) = (&self.frame, &frame)
+                && prev.stream_epoch == next.stream_epoch
+                && !Arc::ptr_eq(prev, next)
+            {
+                let rtt =
+                    self.measured_latency(&self.connection.model.lock().expect("terminal model"));
+                self.local_echo
+                    .reconcile(prev, next, self.local_echo_mode, rtt, self.echo_now());
             }
         }
         self.initial_size
@@ -412,7 +511,7 @@ impl Term {
     }
 
     /// The same send and notice, with acceptance feedback for local path history.
-    /// Defense-in-depth: blocks PTY input while a script prompt or Ports is open, and exits
+    /// Defense-in-depth: blocks PTY input while a prompt or session inspector is open, and exits
     /// copy mode before any PTY input command reaches the worker.
     pub fn try_send(&mut self, command: Command) -> bool {
         let is_any_pty_input = matches!(
@@ -455,6 +554,83 @@ impl Term {
                     CopyModeOp::End,
                 )));
         }
+        if self.local_echo_mode == LocalEcho::Off {
+            return self.forward(command);
+        }
+        let echo_action = match &command {
+            Command::Key(payload) => local_echo::classify_key(payload),
+            Command::KeyWithPrefix { .. }
+            | Command::SendKey(_)
+            | Command::Paste(_)
+            | Command::Reset
+            | Command::Clear
+            | Command::CopyMode(_)
+            | Command::Scroll(_)
+            | Command::Resize(..)
+            | Command::Search(_)
+            | Command::SearchStep(_)
+            | Command::Reconnect
+            | Command::PromptStep(_) => local_echo::InputAction::Reset,
+            Command::Mouse(payload) if payload["action"].as_str() == Some("press") => {
+                local_echo::InputAction::Reset
+            }
+            _ => local_echo::InputAction::Ignore,
+        };
+        if echo_action == local_echo::InputAction::Reset {
+            let (command, seq, baseline, rtt, epoch) = {
+                let model = self.connection.model.lock().expect("terminal model");
+                let (command, seq) = model.input_acks.track_reset(command);
+                (
+                    command,
+                    seq,
+                    model
+                        .frame
+                        .clone()
+                        .filter(|f| f.stream_epoch == model.stream_epoch),
+                    self.measured_latency(&model),
+                    model.stream_epoch,
+                )
+            };
+            let now = self.echo_now();
+            if !self.forward(command) {
+                return false;
+            }
+            if epoch != self.echo_stream_epoch {
+                self.local_echo.reset();
+                self.echo_stream_epoch = epoch;
+            }
+            if let Some(seq) = seq {
+                self.local_echo
+                    .sent_reset(seq, baseline.as_deref(), now, rtt);
+            } else {
+                self.local_echo.interrupt(baseline.as_deref());
+            }
+            return true;
+        }
+        if !self.forward(command) {
+            return false;
+        }
+        if echo_action != local_echo::InputAction::Ignore {
+            if self.preedit.is_empty()
+                && self.search.is_none()
+                && self.copy_mode_active.is_none()
+                && let Some(rtt) = self.echo_latency()
+            {
+                self.local_echo.on_input(
+                    echo_action,
+                    self.frame.as_deref(),
+                    self.local_echo_mode,
+                    rtt,
+                    self.echo_now(),
+                );
+            } else {
+                self.clear_local_echo();
+            }
+        }
+        true
+    }
+
+    fn forward(&mut self, command: Command) -> bool {
         if let Err(error) = self.connection.commands.try_send(command) {
             self.notice = Some(format!("Input not sent: {error}"));
             return false;
@@ -700,6 +876,11 @@ impl Term {
         use rex_rune::terminal::selection::{Geometry, Input, Phase};
         let index = self.index(x, y, cell);
         let cols = usize::from(self.frame.as_ref().map_or(1, |f| f.cols));
+        let cell_width = cell.0.ceil().max(1.) as u32;
+        // Ghostty uses an integer cell width to choose which half of the cell was
+        // hit. Keep the pointer in that same coordinate system, including its
+        // fractional progress across the cell.
+        let x = f64::from(x) * (f64::from(cell_width) / f64::from(cell.0));
         self.selection_revision = self.selection_revision.wrapping_add(1);
         self.copy_wanted = None;
         let input = Input {
@@ -707,10 +888,10 @@ impl Term {
             revision: self.selection_revision,
             phase,
             at: ((index % cols) as u16, (index / cols) as u16),
-            position: (f64::from(x), f64::from(y)),
+            position: (x, f64::from(y)),
             geometry: Geometry {
                 columns: cols as u32,
-                cell_width: cell.0.ceil().max(1.) as u32,
+                cell_width,
                 padding_left: 0,
                 screen_height: self.rect[3].ceil().max(1.) as u32,
             },
@@ -895,7 +1076,7 @@ fn glyph_run(content: String, style: RunStyle, x: f32, y: f32, m: &Metrics) -> E
     if style.strike {
         e = e.strike(0, len, Some(color));
     }
-    e.no_wrap().font(font).color(color).absolute(x + m.inset, y)
+    e.nowrap().font(font).color(color).absolute(x + m.inset, y)
 }
 
 /// (character, bold, italic, the grid's text style) → advances exactly one cell.
@@ -1010,7 +1191,7 @@ impl Segment {
         }
         let mut e = rich(self.text, self.spans)
             // The server owns line breaks. Fractional-DPI rounding must not wrap a run again.
-            .no_wrap()
+            .nowrap()
             .font(m.style)
             .absolute(self.col as f32 * m.cell.0 + m.inset, 0.);
         for (a, b, fg) in self.strikes {
@@ -1421,7 +1602,8 @@ pub struct GridLook {
     /// The shape the pane with the keyboard draws whatever its program asked for (Force
     /// style); none draws the frame's own.
     pub cursor_force: Option<CursorShape>,
-    pub ime: bool,
+    /// The terminal owns the input method when this is set, even without a visible cursor.
+    pub ime: Option<rune::OptionAsAlt>,
     pub colors: TermColors,
 }
 
@@ -1508,10 +1690,20 @@ impl Term {
 
 /// The visible rows of `term`'s frame, each memoized by its content.
 pub fn grid(key: &str, term: &Term, m: &Metrics, look: GridLook) -> El {
-    let Some(frame) = term.display_frame() else {
-        return el().w_full().h_full();
-    };
     let (cw, ch) = m.cell;
+    let ime_anchor = |x, y, mode| {
+        el().key(format!("{key}/ime"))
+            .absolute(x, y)
+            .size(cw, ch)
+            .ime_cursor()
+            .ime_option_as_alt_mode(mode)
+    };
+    let Some(frame) = term.display_frame() else {
+        return el()
+            .w_full()
+            .h_full()
+            .children(look.ime.map(|mode| ime_anchor(0., 0., mode)));
+    };
     let visible = term.visible_rows(m.cell);
     let start = frame.display_row_start(visible);
     let cols = frame.cols as usize;
@@ -1610,6 +1802,67 @@ pub fn grid(key: &str, term: &Term, m: &Metrics, look: GridLook) -> El {
             grid = grid.child(mark);
         }
     }
+    let echo_overlay = (term.local_echo_mode != LocalEcho::Off
+        && term.local_echo.has_pending()
+        && !term.panel_blocks_input
+        && term.search.is_none()
+        && look.cursor == Some(CursorLook::Block)
+        && frame.copy.is_none()
+        && term.preedit.is_empty()
+        && term.selection.is_none())
+    .then(|| {
+        term.local_echo.overlay(
+            frame,
+            term.local_echo_mode,
+            term.echo_latency()?,
+            term.echo_now(),
+        )
+    })
+    .flatten();
+    let echo_cells = echo_overlay.as_ref().map(|ov| {
+        ov.cells
+            .iter()
+            .enumerate()
+            .map(|(i, prediction)| {
+                let mut cell =
+                    frame.cells[usize::from(ov.row)][usize::from(ov.start_col) + i].clone();
+                cell.text.clear();
+                if let Some(ch) = prediction.ch {
+                    cell.text.push(ch);
+                }
+                if prediction.underline {
+                    cell.style.underline = Underline::Single;
+                    cell.underline_color = Some(mix(frame.fg, body, 0.45));
+                }
+                cell
+            })
+            .collect::<Vec<_>>()
+    });
+    if let Some((ov, cells)) = echo_overlay.as_ref().zip(echo_cells.as_ref())
+        && (start..start + visible).contains(&usize::from(ov.row))
+    {
+        let layer = row_pass(
+            cells,
+            0.,
+            RowBg {
+                frame: frame.bg,
+                body,
+            },
+            &Marks::default(),
+            m,
+            RowPass::All,
+            colors,
+        )
+        .key(format!("{key}/local-echo"))
+        .inert()
+        .fill(rgb(body))
+        .absolute(
+            f32::from(ov.start_col) * cw,
+            (usize::from(ov.row) - start) as f32 * ch,
+        )
+        .size(cells.len() as f32 * cw, ch);
+        grid = grid.child(layer);
+    }
     if let Some(view) = frame.copy {
         let (x, y) = view.cursor;
         if let Some(cursor_look) = look.cursor
@@ -1658,13 +1911,22 @@ pub fn grid(key: &str, term: &Term, m: &Metrics, look: GridLook) -> El {
                 }
             }
         }
-    } else if let Some((x, y)) = frame.cursor
+    } else if let Some((x, y)) = echo_overlay.as_ref().map(|ov| ov.cursor).or(frame.cursor)
         && let Some(cursor_look) = look.cursor
         && (y as usize) >= start
         && (y as usize) < start + visible
     {
         let (px, py) = (x as f32 * cw, (y as usize - start) as f32 * ch);
-        let cell = frame.cells.get(y as usize).and_then(|r| r.get(x as usize));
+        let cell = echo_overlay
+            .as_ref()
+            .zip(echo_cells.as_ref())
+            .and_then(|(ov, cells)| {
+                (ov.row == y)
+                    .then(|| x.checked_sub(ov.start_col))
+                    .flatten()
+                    .and_then(|col| cells.get(usize::from(col)))
+            })
+            .or_else(|| frame.cells.get(y as usize).and_then(|r| r.get(x as usize)));
         let color = rgb(frame.cursor_color);
         // A pane without the keyboard always shows a hollow block, whatever the program asked.
         let shape = match cursor_look {
@@ -1687,15 +1949,10 @@ pub fn grid(key: &str, term: &Term, m: &Metrics, look: GridLook) -> El {
             grid = grid.child(glyph_run(cell.text.clone(), style, px, py, m));
         }
     }
-    if look.ime {
+    if let Some(option_as_alt) = look.ime {
         let (col, pane_row) = ime_cell(frame, start, visible, term.visible_cols(m.cell));
         let (px, py) = (col as f32 * cw, pane_row as f32 * ch);
-        grid = grid.child(
-            el().key(format!("{key}/ime"))
-                .absolute(px, py)
-                .size(cw, ch)
-                .ime_cursor(),
-        );
+        grid = grid.child(ime_anchor(px, py, option_as_alt));
         if !term.preedit.is_empty() {
             let len = term.preedit.len();
             grid = grid.child(
@@ -1707,7 +1964,7 @@ pub fn grid(key: &str, term: &Term, m: &Metrics, look: GridLook) -> El {
                     }],
                 )
                 .key(format!("{key}/preedit"))
-                .no_wrap()
+                .nowrap()
                 .font(m.style)
                 .color(rgb(frame.fg))
                 .fill(rgb(body))
@@ -1992,7 +2249,7 @@ mod tests {
         let look = GridLook {
             cursor: None,
             cursor_force: None,
-            ime: false,
+            ime: None,
             colors: TermColors::default(),
         };
         el().w_full()
@@ -2003,7 +2260,7 @@ mod tests {
     /// The search highlights `term` draws: (first column, row in the pane, selected).
     fn drawn_matches(term: Term) -> Vec<(u32, u32, bool)> {
         let (cw, ch) = clipped_metrics().cell;
-        let mut rt = Runtime::new(
+        let mut rt = crate::app::fonts::test_runtime(
             ClippedState { term },
             clipped_view,
             (600., 200.),
@@ -2077,7 +2334,7 @@ mod tests {
     /// Construct only under a family guard: TextSystem also registers measurement fonts.
     fn bundled_row_fonts() -> rune::text::TextSystem {
         let fonts = crate::app::fonts::load("IBM Plex Mono", &[]);
-        rune::text::TextSystem::new_with_paths(fonts.files, &[], fonts.families)
+        rune::text::TextSystem::new(fonts.files, fonts.families)
     }
 
     /// A row at 1.5 device pixels per point, placed off the pixel grid.
@@ -2212,7 +2469,7 @@ mod tests {
             let marks = link_marks("g", &s.frame, &s.link, 0..2, &m, MIDNIGHT.card);
             el().w_full().h_full().children(marks)
         };
-        let mut rt = Runtime::new(
+        let mut rt = crate::app::fonts::test_runtime(
             LinkState { frame, link },
             view,
             (600., 100.),
@@ -2257,12 +2514,12 @@ mod tests {
             let look = GridLook {
                 cursor: None,
                 cursor_force: None,
-                ime: false,
+                ime: None,
                 colors: TermColors::default(),
             };
             grid("g", term, &clipped_metrics(), look)
         };
-        let mut rt = Runtime::new(term, view, (200., 100.), Env::default());
+        let mut rt = crate::app::fonts::test_runtime(term, view, (200., 100.), Env::default());
         rt.frame(0.);
         let highlight = |alpha| rgb(colors.search_match).alpha(alpha);
         let marks: Vec<_> = rt
@@ -2283,7 +2540,7 @@ mod tests {
         // The selected match's six letters are drawn in its mark's text colour; the two
         // before it keep the terminal's.
         let glyphs = |colour: rune::Color| {
-            let fill = [colour.r, colour.g, colour.b, colour.a];
+            let fill = colour.premul_srgb(1.);
             rt.instances
                 .iter()
                 .filter(|q| q.params[1] == rune::render::KIND_GLYPH && q.fill == fill)
@@ -2487,7 +2744,7 @@ mod tests {
             let look = GridLook {
                 cursor: Some(CursorLook::Block),
                 cursor_force: None,
-                ime: false,
+                ime: None,
                 colors: s.colors,
             };
             el().w_full()
@@ -2495,7 +2752,7 @@ mod tests {
                 .motion(crate::app::theme::STILL)
                 .child(grid("g", &s.term, &clipped_metrics(), look))
         };
-        let mut rt = Runtime::new(
+        let mut rt = crate::app::fonts::test_runtime(
             State {
                 term,
                 colors: dark_declared,
@@ -2506,7 +2763,7 @@ mod tests {
         );
         let glyph_count = |rt: &Runtime<State>, color: u32| {
             let c = rgb(color);
-            let want = [c.r, c.g, c.b, c.a];
+            let want = c.premul_srgb(1.);
             rt.instances
                 .iter()
                 .filter(|q| q.params[1] == rune::render::KIND_GLYPH && q.fill == want)
@@ -2588,7 +2845,7 @@ mod tests {
             let look = GridLook {
                 cursor: s.cursor,
                 cursor_force: None,
-                ime: s.ime,
+                ime: s.ime.then_some(rune::OptionAsAlt::None),
                 colors: TermColors::default(),
             };
             el().w_full()
@@ -2607,7 +2864,7 @@ mod tests {
         terminal.vt_write(b"abc\x1b[?25l\x1b[3;5H");
 
         // Hidden cursor + look.ime == true: ime_area aligned with cursor cell, no /cursor drawn.
-        let mut rt = Runtime::new(
+        let mut rt = crate::app::fonts::test_runtime(
             ImeState {
                 term: ime_test_term(&terminal, full_rect),
                 ime: true,

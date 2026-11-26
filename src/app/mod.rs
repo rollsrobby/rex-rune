@@ -42,6 +42,7 @@ pub(crate) mod platform;
 mod popups;
 mod ports;
 mod program_icons;
+mod program_resume;
 mod prompts;
 mod recorder;
 mod remote;
@@ -74,29 +75,26 @@ mod widgets;
 mod workspace;
 
 use rex_rune::{connection::Options, settings::Settings};
-use rune::{AppSpec, Cursor, Cx, El, Tx, WindowEdge, col, el, row};
+use rune::{AppSpec, Cx, El, ResizeEdge, Tx, col, el, row};
 use std::time::Duration;
 use theme::*;
 use workspace::Workspace;
 
 const APP_ICON: &[u8] = include_bytes!("../../resources/icons/256x256/apps/dev.shuv.rex-rune.png");
 
-fn resize_band(e: WindowEdge) -> El {
+fn resize_band(e: ResizeEdge) -> El {
     let b = 6.;
     let corner = 12.;
-    let el = el()
-        .key(format!("resize:{e:?}"))
-        .window_resize(e)
-        .cursor(Cursor::ResizeEdge(e));
+    let el = el().key(format!("resize:{e:?}")).window_resize(e);
     match e {
-        WindowEdge::North => el.pin(Some(corner), Some(0.), Some(corner), None).h(b),
-        WindowEdge::South => el.pin(Some(corner), None, Some(corner), Some(0.)).h(b),
-        WindowEdge::West => el.pin(Some(0.), Some(corner), None, Some(corner)).w(b),
-        WindowEdge::East => el.pin(None, Some(corner), Some(0.), Some(corner)).w(b),
-        WindowEdge::NorthWest => el.pin(Some(0.), Some(0.), None, None).size(corner, corner),
-        WindowEdge::NorthEast => el.pin(None, Some(0.), Some(0.), None).size(corner, corner),
-        WindowEdge::SouthWest => el.pin(Some(0.), None, None, Some(0.)).size(corner, corner),
-        WindowEdge::SouthEast => el.pin(None, None, Some(0.), Some(0.)).size(corner, corner),
+        ResizeEdge::North => el.pin(Some(corner), Some(0.), Some(corner), None).h(b),
+        ResizeEdge::South => el.pin(Some(corner), None, Some(corner), Some(0.)).h(b),
+        ResizeEdge::West => el.pin(Some(0.), Some(corner), None, Some(corner)).w(b),
+        ResizeEdge::East => el.pin(None, Some(corner), Some(0.), Some(corner)).w(b),
+        ResizeEdge::NorthWest => el.pin(Some(0.), Some(0.), None, None).size(corner, corner),
+        ResizeEdge::NorthEast => el.pin(None, Some(0.), Some(0.), None).size(corner, corner),
+        ResizeEdge::SouthWest => el.pin(Some(0.), None, None, Some(0.)).size(corner, corner),
+        ResizeEdge::SouthEast => el.pin(None, None, Some(0.), Some(0.)).size(corner, corner),
     }
 }
 
@@ -104,8 +102,8 @@ pub(crate) fn view(s: &Workspace, cx: &mut Cx<Workspace>) -> El {
     set_palette(palette_of(s.settings.chrome_theme));
     let scale = s.ui_scale();
     let viewport = s.viewport.map(|v| v / scale);
-    let maximized = cx.window_maximized();
-    let full_screen = cx.window_full_screen();
+    let maximized = cx.is_maximized();
+    let full_screen = cx.is_full_screen();
     let insets = cx.chrome_insets();
     if s.unified_title {
         // The title row grows with the interface zoom, and the traffic lights stay centred in it.
@@ -127,11 +125,6 @@ pub(crate) fn view(s: &Workspace, cx: &mut Cx<Workspace>) -> El {
         .scale(scale)
         .scale_motion(STILL)
         .fill(rgb(ground()));
-    // Hover tracks position even behind content. Keep the band below both panes and
-    // toolbar so secondary presses reach their context menus rather than this sibling.
-    if s.settings.interface.toolbar == rex_rune::settings::interface::ToolbarBehavior::OnHover {
-        root = root.child(toolbar_reveal::band(s));
-    }
     root = root.child(
         col()
             .absolute(0., 0.)
@@ -183,7 +176,18 @@ pub(crate) fn view(s: &Workspace, cx: &mut Cx<Workspace>) -> El {
     };
     root = root.child(open.unwrap_or_else(popups::overlay));
     let mut window = el()
-        .key("window")
+        .key(input::TERMINAL_FOCUS)
+        // Rune delivers physical events only to the focused element. Keep this out of
+        // the tab order and yield to any actual control, especially the find field.
+        .tab_index(-1)
+        .focusable(s.option_choice && s.panel.is_none())
+        .no_focus_ring()
+        // Take terminal keys before Rune's activation and traversal. This also
+        // makes clicking the grid focus its keyboard-owning ancestor, not blur it.
+        .on_key(|s: &mut Workspace, ev, tx| {
+            tx.focused() == Some(input::TERMINAL_FOCUS) && input::on_key(s, ev, tx)
+        })
+        .on_physical_input(input::on_physical_input)
         .pointer_buttons([rune::PointerButton::Back, rune::PointerButton::Forward])
         .on_press_tx(|s: &mut Workspace, tx: &mut Tx| {
             if s.panel.is_some() || s.drag.is_some() || s.layer_drag.is_some() {
@@ -219,17 +223,27 @@ pub(crate) fn view(s: &Workspace, cx: &mut Cx<Workspace>) -> El {
                 })
         }))
         .child(root);
+    let hover =
+        s.settings.interface.toolbar == rex_rune::settings::interface::ToolbarBehavior::OnHover;
+    if hover {
+        window = window
+            .on_pointer_move_local(toolbar_reveal::pointer)
+            .on_hover_change(toolbar_reveal::window_hover);
+    }
+    if hover || s.settings.terminal.local_echo != rex_rune::settings::terminal::LocalEcho::Off {
+        window = window.on_any_press(toolbar_reveal::pointer_press);
+    }
     // Native resize targets stay in window points at every content zoom. The corner above
     // Close belongs to Close rather than the resize band.
     if s.own_frame && !maximized && !full_screen {
         for edge in [
-            WindowEdge::South,
-            WindowEdge::West,
-            WindowEdge::East,
-            WindowEdge::SouthWest,
-            WindowEdge::SouthEast,
-            WindowEdge::North,
-            WindowEdge::NorthWest,
+            ResizeEdge::South,
+            ResizeEdge::West,
+            ResizeEdge::East,
+            ResizeEdge::SouthWest,
+            ResizeEdge::SouthEast,
+            ResizeEdge::North,
+            ResizeEdge::NorthWest,
         ] {
             window = window.child(resize_band(edge));
         }
@@ -237,9 +251,12 @@ pub(crate) fn view(s: &Workspace, cx: &mut Cx<Workspace>) -> El {
     window
 }
 
-fn poll(s: &mut Workspace, _: f64, tx: &mut Tx) -> bool {
+fn poll(s: &mut Workspace, clock: f64, tx: &mut Tx) -> bool {
     let now = std::time::Instant::now();
-    s.sync_option_key(tx, false);
+    s.sync_option_layout();
+    if s.option_choice && s.panel.is_none() && tx.focused().is_none() {
+        tx.focus(input::TERMINAL_FOCUS, false);
+    }
     let (activity_changed, next_activity) = s.refresh_activity_at(now);
     if let Some(delay) = next_activity {
         tx.wake_after(delay);
@@ -256,12 +273,14 @@ fn poll(s: &mut Workspace, _: f64, tx: &mut Tx) -> bool {
     let settings_changed = s.poll_settings(now, tx);
     let prompts_changed = s.poll_prompts(now, tx);
     let focus_history_changed = s.poll_focus_history(now, tx);
+    let toolbar_changed = toolbar_reveal::poll(s, clock);
     let mut changed = s.poll_navigation(now, tx)
         || remote_changed
         || updates_changed
         || settings_changed
         || prompts_changed
         || focus_history_changed
+        || toolbar_changed
         || activity_changed
         || server_changed;
     if let Some(panel) = &mut s.panel
@@ -312,13 +331,32 @@ fn poll(s: &mut Workspace, _: f64, tx: &mut Tx) -> bool {
     if s.notices.iter().any(|n| !n.sticky) {
         tx.wake_after(Duration::from_secs(1));
     }
-    // A pane waiting for a frame at its size draws anyway at its deadline; be awake for it.
+    // A pane waiting for a frame at its size draws anyway at its deadline, and a pane with
+    // pending local-echo predictions wakes to underline or expire them.
     let now = std::time::Instant::now();
     for term in s.terminals.values_mut() {
         if term.draw_anyway(now) {
             changed = true;
         } else if let Some(deadline) = term.draws_anyway_at() {
             tx.wake_after(deadline - now);
+        }
+    }
+    if s.settings.terminal.local_echo != rex_rune::settings::terminal::LocalEcho::Off {
+        let active = s
+            .window_focused
+            .then(|| s.focused_block())
+            .flatten()
+            .map(|id| s.term_key(&id));
+        for (key, term) in &mut s.terminals {
+            if Some(key) != active.as_ref() || s.panel.is_some() || term.search.is_some() {
+                term.clear_local_echo();
+                continue;
+            }
+            let (redraw, wake) = term.poll_local_echo(now);
+            changed |= redraw;
+            if let Some(time) = wake {
+                tx.wake_after(time.saturating_duration_since(now));
+            }
         }
     }
     changed
@@ -354,9 +392,7 @@ pub fn run(
     };
     let size = options.startup_size(&settings);
     let (family, fallbacks) = options.fonts(&settings);
-    let fonts = fonts::load(family, fallbacks);
-    rune::text::set_app_font_paths(fonts.paths)
-        .map_err(|_| anyhow::anyhow!("terminal fonts were already initialized"))?;
+    let fonts = fonts::launch(family, fallbacks);
     rune::set_app_id("dev.shuv.rex-rune");
     if let Err(error) = rune::set_app_icon(APP_ICON) {
         eprintln!("Could not load the Rex window icon: {error}");
@@ -372,7 +408,7 @@ pub fn run(
             s.logo = Some(images.load(APP_ICON));
             s.images = Some(images);
         }),
-        on_key: Some(input::on_key),
+        on_key: Some(input::on_window_key),
         poll: Some(poll),
         ..AppSpec::new("Rex", size, placeholder, view)
     });
@@ -389,6 +425,7 @@ pub fn run(
             workspace.stand_in_family = stand_in;
             workspace.restart = restart_request;
             workspace.sounds = sounds;
+            workspace.font_catalog();
             match recovery_notice {
                 Some(StartupNotice::Error(notice)) => workspace.notify(notice),
                 Some(StartupNotice::Info(notice)) => workspace.inform(notice),

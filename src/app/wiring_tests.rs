@@ -279,6 +279,24 @@ fn listening_ports_is_local_and_unbound_but_can_be_recorded() {
 }
 
 #[test]
+fn program_resume_is_local_and_has_one_unbound_shortcuts_row() {
+    let (ws, _) = tabbed_workspace("split");
+    let action = "client.program_resume";
+    let spec = actions::find(action).unwrap();
+    assert!(matches!(spec.remote(), Remote::Never(_)));
+    assert!(spec.requires_person());
+    assert!(ws.shortcut_chords(action, &Value::Null).is_empty());
+    let rows: Vec<_> = ws
+        .shortcut_rows()
+        .into_iter()
+        .filter(|row| row.action == action)
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].title, "Show program resume");
+    assert!(rows[0].keys.is_empty());
+}
+
+#[test]
 fn focus_history_is_local_unbound_and_recordable_with_scoped_rows() {
     let (mut ws, _) = tabbed_workspace("split");
     ws.hosts[0].model.protocol.api_revision = 21;
@@ -367,7 +385,7 @@ fn the_merged_surfaces_draw() {
         );
         framed_terminal(&mut ws, "block:c", &sender, b"$ tail -f server.log");
         prepare(&mut ws);
-        let mut rt = Runtime::new(ws, view, (1024., 700.), Env::new(true, 2.));
+        let mut rt = crate::app::fonts::test_runtime(ws, view, (1024., 700.), Env::new(true, 2.));
         rt.on_key = Some(crate::app::input::on_key);
         for _ in 0..90 {
             rt.frame(1. / 60.);

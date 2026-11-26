@@ -11,20 +11,28 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 pub mod activity;
+mod batch;
+use batch::{declare_themes, query_activity};
 pub mod clipboard;
 pub mod directory;
 pub mod downloads;
 pub mod focus_history;
 pub mod hosts;
+mod input;
 pub mod ports;
 mod prefetch;
+mod program_resume;
 pub mod server_info;
 mod status_sweep;
+mod title_wake;
 pub mod titles;
 mod view_fetch;
 
@@ -152,6 +160,8 @@ pub mod perform;
 pub mod prompt;
 
 pub enum Command {
+    /// Local receipt carried beside a reset input, never serialized on the wire.
+    EchoReset(Box<(Command, InputReceipt)>),
     Selection(crate::terminal::selection::Input),
     CopyMode(crate::terminal::copy_mode::CopyModeInput),
     Key(Value),
@@ -185,8 +195,106 @@ pub enum Command {
     Clear,
 }
 
+impl Command {
+    fn untracked(&self) -> &Self {
+        match self {
+            Self::EchoReset(tracked) => &tracked.0,
+            other => other,
+        }
+    }
+}
+
+/// Host-wide smoothed round trip. Zero encodes unknown; one encodes a measured zero.
+#[derive(Default, Debug)]
+pub struct Rtt {
+    value: std::sync::atomic::AtomicU32,
+    enabled: std::sync::atomic::AtomicBool,
+}
+impl Rtt {
+    /// Local preference shared by this host's control and data workers.
+    pub fn enable(&self, enabled: bool) {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn ms(&self) -> Option<u32> {
+        self.value
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .checked_sub(1)
+    }
+    fn record(&self, elapsed: Duration) {
+        let sample = elapsed.as_millis().min(5000) as u32;
+        let value = self
+            .ms()
+            .map_or(sample, |ms| (3 * ms.min(5000) + sample) / 4);
+        self.value
+            .store(value + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn clear(&self) {
+        self.value.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Only opt-in panes allocate a counter shared by the control and data workers.
+#[derive(Default)]
+pub struct InputAcks {
+    issued: AtomicU64,
+    slot: OnceLock<Arc<AtomicU64>>,
+}
+pub struct InputReceipt {
+    seq: u64,
+    slot: Arc<AtomicU64>,
+}
+impl InputReceipt {
+    fn complete(self) {
+        self.slot.fetch_max(self.seq, Ordering::Release);
+    }
+}
+impl InputAcks {
+    fn slot(&self) -> Arc<AtomicU64> {
+        self.slot.get_or_init(Default::default).clone()
+    }
+    fn disconnect(&self) {
+        if let Some(slot) = self.slot.get() {
+            slot.store(0, Ordering::Release);
+        }
+    }
+    /// Only server-bound resets need a reply. View operations keep their ordinary frame barrier.
+    pub fn track_reset(&self, command: Command) -> (Command, Option<u64>) {
+        if !matches!(
+            command,
+            Command::Key(_)
+                | Command::KeyWithPrefix { .. }
+                | Command::SendKey(_)
+                | Command::Paste(_)
+                | Command::Mouse(_)
+                | Command::Resize(..)
+                | Command::Reset
+                | Command::Clear
+        ) {
+            return (command, None);
+        }
+        let seq = self.issued.fetch_add(1, Ordering::Relaxed) + 1;
+        (
+            Command::EchoReset(Box::new((
+                command,
+                InputReceipt {
+                    seq,
+                    slot: self.slot(),
+                },
+            ))),
+            Some(seq),
+        )
+    }
+}
+
 #[derive(Default)]
 pub struct Model {
+    pub input_acks: InputAcks,
+    pub rtt: Arc<Rtt>,
+    pub stream_epoch: u64,
     pub frame: Option<Arc<Frame>>,
     pub status: String,
     pub session: String,
@@ -263,6 +371,7 @@ const STOP_ACCEPTED: &str = "Server stop accepted. Rex Rune will not start it ag
 
 #[derive(Clone, Default)]
 pub struct HostModel {
+    pub rtt: Arc<Rtt>,
     /// Setup problems from the last read-only SSH lookup.
     pub ssh_problem: Option<crate::ssh::Problem>,
     pub visible: bool,
@@ -334,7 +443,7 @@ pub struct HostModel {
     /// Initial activity coverage on this connection, not a read receipt.
     pub activity_reading: bool,
     pub activity_incomplete: bool,
-    /// The server refused `set_theme`, so this host is never sent a theme again.
+    /// The server refused `set_theme` on this connection.
     pub themes_unsupported: bool,
     /// A theme was declared to this server, by `set_theme` or in a new block's layout.
     pub theme_declared: bool,
@@ -352,6 +461,12 @@ pub struct HostModel {
     pub ports_reading: HashSet<String>,
     /// Monotonic count of completed `com.superlogical.terminal.ports` reads on this connection.
     pub ports_read_completions: u64,
+    /// Latest metadata-only resume records for terminal blocks in held views.
+    pub program_resume: HashMap<String, crate::program_resume::ResumeSnapshot>,
+    /// Blocks with queued or in-flight on-demand resume reads.
+    pub program_resume_reading: HashSet<String>,
+    /// This API 24+ connection explicitly refused the read as unsupported.
+    pub program_resume_unsupported: bool,
 }
 impl HostModel {
     /// Record a block's owner (none when nobody owns it), in its session's view and its pane.
@@ -443,11 +558,7 @@ impl HostModel {
                 }
             }
             BlockEvent::Title { text, owner } => {
-                if text.is_empty() {
-                    self.titles.remove(&block);
-                } else {
-                    self.titles.insert(block, (text, owner));
-                }
+                self.set_title(block, text, owner);
             }
             BlockEvent::Notification { title, body } => {
                 // A program spamming notifications can't grow this without bound.
@@ -474,6 +585,18 @@ impl HostModel {
             }
         }
     }
+    fn set_title(&mut self, block: String, text: String, owner: Option<u64>) -> bool {
+        if text.is_empty() {
+            return self.titles.remove(&block).is_some();
+        }
+        let value = (text, owner);
+        if self.titles.get(&block) == Some(&value) {
+            return false;
+        }
+        self.titles.insert(block, value);
+        true
+    }
+
     fn forget_block(&mut self, block: &str) {
         self.activity.remove(block);
         self.status_read.remove(block);
@@ -486,6 +609,8 @@ impl HostModel {
         self.progress.remove(block);
         self.ports.remove(block);
         self.ports_reading.remove(block);
+        self.program_resume.remove(block);
+        self.program_resume_reading.remove(block);
     }
 
     /// The block's terminal title while it's current. Shells rarely clear a title when the
@@ -589,6 +714,12 @@ pub enum HostCommand {
     ReadPorts {
         epoch: u64,
         session: String,
+    },
+    /// Open or close on-demand Program Resume inspection on this epoch (API 24+).
+    /// Only the selected foreground session is eligible for reads.
+    WatchProgramResume {
+        epoch: u64,
+        session: Option<String>,
     },
     /// Create or update one host in this server's shared host list (`hosts.put`) on `epoch` only.
     /// Never auto-retried or queued across reconnects.
@@ -746,8 +877,9 @@ struct ControlState {
     /// Sessions with an in-flight on-demand `FetchView` whose layout changed meanwhile.
     fetch_reading: HashSet<String>,
     fetch_stale: HashSet<String>,
-    /// The theme last declared to each block on this connection.
+    /// Last attempted declaration per block, including inconclusive replies.
     themed: HashMap<String, SetTheme>,
+    theme_set_supported: Option<bool>,
     // This pool is scoped to the terminal data ref and subprotocol; other sources
     // are filtered out before insertion. It lives only as long as this control socket.
     tickets: HashMap<(String, String), PendingTicket>,
@@ -755,6 +887,8 @@ struct ControlState {
     ports_seq: HashMap<String, u64>,
     /// On-demand detached `com.superlogical.terminal.ports` reader for this connection.
     ports_reads: ports::Reader,
+    resume_seq: HashMap<String, u64>,
+    resume_reads: program_resume::Reader,
 }
 
 impl ControlState {
@@ -828,6 +962,8 @@ impl ControlState {
         self.tickets.retain(|(_, b), _| b != block);
         self.ports_seq.remove(block);
         self.ports_reads.cancel_block(block);
+        self.resume_seq.remove(block);
+        self.resume_reads.cancel_block(block);
     }
 
     fn forget_session(&mut self, id: &str, blocks: impl IntoIterator<Item = String>) {
@@ -841,6 +977,7 @@ impl ControlState {
         self.fetch_stale.remove(id);
         self.tickets.retain(|(s, _), _| s != id);
         self.ports_reads.cancel_session(id);
+        self.resume_reads.cancel_session(id);
         for block in blocks {
             self.forget_block(&block);
         }
@@ -860,8 +997,7 @@ impl ControlState {
         if list_event || event_type == "session_label_changed" {
             floor = floor.max(self.list_seq);
         }
-        // Views contain state, not transient clipboard events, ports_changed events, or
-        // list-level session events.
+        // Views contain layout, not clipboard, listening ports, Program Resume, or session lists.
         let session = event.session_id.as_deref().or_else(|| {
             (event.name == "event_dropped")
                 .then(|| event.payload["session_id"].as_str())
@@ -869,12 +1005,15 @@ impl ControlState {
         });
         let is_copy = event.name == "block_event" && clipboard::is_copy(&event.payload);
         let is_ports = event.name == "block_event" && ports::is_ports_changed(&event.payload);
+        let is_resume =
+            event.name == "block_event" && program_resume::is_resume_changed(&event.payload);
         // `session.view` carries layout, not program status, title, or process metadata, so
         // only `session_view_changed` drops are superseded by a newer `view_seq`.
         let view_covered = event.name != "event_dropped" || event_type == "session_view_changed";
         if !list_event
             && !is_copy
             && !is_ports
+            && !is_resume
             && view_covered
             && let Some(id) = session
         {
@@ -946,18 +1085,20 @@ impl Drop for HostConnection {
 #[derive(Clone)]
 struct Shared {
     model: Arc<Mutex<HostModel>>,
-    wake: flume::Sender<()>,
+    wake: Arc<title_wake::HostWake>,
 }
 impl Shared {
     fn update(&self, change: impl FnOnce(&mut HostModel)) {
         change(&mut self.model.lock().expect("host model"));
-        let _ = self.wake.try_send(());
+        self.wake.notify();
     }
     fn status(&self, status: impl Into<String>, connected: bool) {
         self.update(|m| {
             m.status = status.into();
             m.connected = connected;
             if !connected {
+                m.rtt.clear();
+                self.wake.reset_titles();
                 m.clipboard = None;
                 m.prompt_events.clear();
                 m.actions_in_flight = 0;
@@ -965,14 +1106,18 @@ impl Shared {
                 m.keymap_revision += 1;
                 m.ports.clear();
                 m.ports_reading.clear();
+                m.program_resume.clear();
+                m.program_resume_reading.clear();
+                m.program_resume_unsupported = false;
                 m.focus_history_result = None;
             }
             for terminal in m.terminals.values() {
-                terminal
-                    .model
-                    .lock()
-                    .expect("terminal model")
-                    .control_connected = connected;
+                let mut pane = terminal.model.lock().expect("terminal model");
+                if pane.control_connected != connected {
+                    pane.stream_epoch += 1;
+                    pane.input_acks.disconnect();
+                }
+                pane.control_connected = connected;
             }
         });
     }
@@ -981,7 +1126,7 @@ impl Shared {
 struct PaneShared {
     model: Arc<Mutex<Model>>,
     wake: flume::Sender<()>,
-    host_wake: flume::Sender<()>,
+    host_wake: Arc<title_wake::HostWake>,
 }
 impl PaneShared {
     fn update(&self, change: impl FnOnce(&mut Model)) {
@@ -993,9 +1138,13 @@ impl PaneShared {
     fn status(&self, status: impl Into<String>, connected: bool) {
         self.update(|m| {
             m.status = status.into();
+            if !connected || !m.connected {
+                m.stream_epoch += 1;
+                m.input_acks.disconnect();
+            }
             m.connected = connected;
         });
-        let _ = self.host_wake.try_send(());
+        self.host_wake.notify();
     }
 }
 
@@ -1196,7 +1345,7 @@ impl HostConnection {
         let (wake, notifications) = flume::bounded(1);
         let shared = Shared {
             model: model.clone(),
-            wake,
+            wake: title_wake::HostWake::new(wake),
         };
         let sender = commands.clone();
         let alive = HostThread(Arc::as_ptr(&model) as usize);
@@ -1304,7 +1453,10 @@ fn replace_view(
         }
         apply_view_to_model(m, id, view);
         if !added.is_empty() {
-            state.ports_reads.enqueue_new_watched_blocks(m, id, added);
+            state
+                .ports_reads
+                .enqueue_new_watched_blocks(m, id, added.iter().cloned());
+            state.resume_reads.enqueue_new_watched_blocks(m, id, added);
         }
     });
 }
@@ -1532,6 +1684,7 @@ fn reconcile(
                     continue;
                 }
                 let state = Arc::new(Mutex::new(Model {
+                    rtt: model.rtt.clone(),
                     status: "Restoring terminal…".into(),
                     session: session_id.clone(),
                     block: id.clone(),
@@ -1581,6 +1734,22 @@ fn reconcile(
     }
 }
 
+/// A host switch publishes pending titles and updates pane workers without a control RPC.
+fn apply_visibility(
+    visible: bool,
+    endpoint: &str,
+    shared: &Shared,
+    sender: &flume::Sender<HostCommand>,
+    workers: &mut HashMap<String, PaneWorker>,
+    state: &mut ControlState,
+) {
+    shared.update(|m| m.visible = visible);
+    ports::reconcile_selected(shared, state);
+    program_resume::reconcile_selected(shared, state);
+    state.prune(&shared.model.lock().expect("host model"));
+    reconcile(endpoint, shared, sender, workers);
+}
+
 fn view_blocks(view: &session::ViewResponse) -> impl Iterator<Item = String> + '_ {
     view.windows
         .iter()
@@ -1588,106 +1757,6 @@ fn view_blocks(view: &session::ViewResponse) -> impl Iterator<Item = String> + '
         .flat_map(|l| &l.blocks)
         .filter(|b| b.creator_name.as_deref() == Some(activity::TERMINAL))
         .filter_map(|b| b.block_id.clone())
-}
-
-/// Ask once per block of the selected session what its programs last reported, its title,
-/// and which program runs in it. Streamed blocks also need this one initial process read:
-/// older process_changed events omit home. Never poll or prefetch other sessions for titles.
-/// A failed query leaves the block without activity; it isn't retried.
-async fn query_activity(control: &mut Client, shared: &Shared, state: &mut ControlState) {
-    let (session, blocks) = {
-        let m = shared.model.lock().expect("host model");
-        if !m.connected {
-            return;
-        }
-        let Some(view) = m.view() else { return };
-        let Some(session) = m.selected.clone() else {
-            return;
-        };
-        let blocks: Vec<_> = view_blocks(view)
-            .filter(|b| !state.queried.contains(b))
-            .collect();
-        (session, blocks)
-    };
-    for block in blocks {
-        state.queried.insert(block.clone());
-        let target = json!({"session_id":session, "block_id":block, "args":{}});
-        let method = format!("{}.program_status", activity::TERMINAL);
-        if state.status_queried.insert(block.clone()) {
-            let reply = request(control, &method, target.clone()).await.ok();
-            // Awaited: events that arrive meanwhile are applied after this, in order.
-            status_sweep::record(shared, state, &session, &block, reply, &HashSet::new());
-        }
-        let method = format!("{}.title", activity::TERMINAL);
-        if let Ok(reply) = request(control, &method, target.clone()).await {
-            let title = activity::parse_title(&reply);
-            shared.update(|m| m.apply_block_event(&session, block.clone(), title));
-        }
-        let method = format!("{}.process", activity::TERMINAL);
-        // Best-effort metadata must not hold up attachment or input for the normal
-        // eight-second request timeout. Events continue to refresh it afterward.
-        if let Ok(Ok(reply)) =
-            tokio::time::timeout(Duration::from_secs(1), control.call_raw(&method, target)).await
-        {
-            let process = activity::parse_process(&reply);
-            shared.update(|m| m.apply_block_event(&session, block, process));
-        }
-    }
-}
-
-/// Declare `theme` to each streamed block Rex would apply it to at once: blocks this client
-/// owns or nobody owns. A block another client owns is left alone; Rex would hold the theme
-/// until this client takes it, and taking it brings the block here again. Under Follow server
-/// (`theme` none), a block this connection declared to gets one empty theme, Rex's own
-/// colours, so the last declaration doesn't stay behind. Repeats are skipped.
-async fn declare_themes(
-    control: &mut Client,
-    shared: &Shared,
-    state: &mut ControlState,
-    workers: &HashMap<String, PaneWorker>,
-    theme: Option<&SetTheme>,
-) {
-    let due: Vec<_> = {
-        let m = shared.model.lock().expect("host model");
-        if m.themes_unsupported || !m.connected {
-            return;
-        }
-        workers
-            .iter()
-            .filter_map(|(block, worker)| {
-                let last = state.themed.get(block);
-                let wanted = match theme {
-                    Some(theme) => theme.clone(),
-                    None if last.is_some_and(|t| *t != SetTheme::new()) => SetTheme::new(),
-                    None => return None,
-                };
-                (last != Some(&wanted) && m.themable(&worker.session, block))
-                    .then(|| (worker.session.clone(), block.clone(), wanted))
-            })
-            .collect()
-    };
-    for (session, block, wanted) in due {
-        let call = control.call(wanted.clone().on(session, block.clone()));
-        match tokio::time::timeout(Duration::from_secs(8), call).await {
-            Ok(Err(rexrs::Error::Api(
-                rexrs::ApiError::MethodNotFound { .. } | rexrs::ApiError::NotSupported { .. },
-            ))) => {
-                shared.update(|m| {
-                    m.themes_unsupported = true;
-                    m.notice = Some(
-                        "This Rex server doesn't take terminal themes; its panes keep the server's colours."
-                            .into(),
-                    );
-                });
-                return;
-            }
-            // A block that closed meanwhile or a slow reply isn't retried on this connection.
-            _ => {
-                state.themed.insert(block, wanted);
-                shared.update(|m| m.theme_declared = true);
-            }
-        }
-    }
 }
 
 fn remove_session(
@@ -1880,10 +1949,31 @@ async fn handle_event(
                     .await?;
                 return Ok(());
             }
+            if event_type == "block_event" && block_event_name == Some(program_resume::EVENT) {
+                program_resume::handle_dropped(
+                    control,
+                    shared,
+                    state,
+                    session_id,
+                    dropped_block,
+                    event.seq,
+                )
+                .await?;
+                return Ok(());
+            }
             if event_type.is_empty() || (event_type == "block_event" && block_event_name.is_none())
             {
                 ports::handle_dropped(control, shared, state, session_id, dropped_block, event.seq)
                     .await?;
+                program_resume::handle_dropped(
+                    control,
+                    shared,
+                    state,
+                    session_id,
+                    dropped_block,
+                    event.seq,
+                )
+                .await?;
             }
             match event_type {
                 "session_destroyed" => {
@@ -2092,6 +2182,24 @@ async fn handle_event(
                 }
                 return Ok(());
             }
+            if program_resume::is_resume_changed(&event.payload) {
+                if control.welcome().api_revision >= crate::program_resume::MIN_API_REVISION
+                    && let (Some(session), Some(block)) = (
+                        event.session_id.as_deref(),
+                        event.payload["block_id"].as_str(),
+                    )
+                {
+                    program_resume::apply_event(
+                        shared,
+                        state,
+                        session,
+                        block,
+                        event.seq,
+                        &event.payload["payload"],
+                    );
+                }
+                return Ok(());
+            }
             let (Some(id), Some((block, change))) = (
                 event.session_id.as_deref(),
                 activity::parse_block_event(&event.payload),
@@ -2107,7 +2215,7 @@ async fn handle_event(
                 let m = shared.model.lock().expect("host model");
                 !m.views.contains_key(id) && m.sessions.iter().any(|s| s.session_id == id)
             };
-            shared.update(|m| m.apply_block_event(id, block, change));
+            shared.block_event(id, block, change);
             // Read-only, and allowed for any session once attach_all is active. The layout
             // read is left to the paced background reader, so it never holds this event up,
             // but it goes to the front: a live report should not wait for the whole pass.
@@ -2125,8 +2233,12 @@ async fn handle_event(
         _ => {}
     }
     ports::reconcile_selected(shared, state);
+    program_resume::reconcile_selected(shared, state);
     if state.ports_reads.can_pump() {
         state.ports_reads.pump(control, shared).await?;
+    }
+    if state.resume_reads.can_pump() {
+        state.resume_reads.pump(control, shared).await?;
     }
     Ok(())
 }
@@ -2225,6 +2337,7 @@ async fn run_host(
             let wanted = preferred.clone().or_else(|| shared.model.lock().expect("host model").selected.clone());
             shared.update(|m| {
                 m.connection_epoch += 1;
+                m.themes_unsupported = false;
                 m.performs.clear();
                 m.prompt_events.clear();
                 m.actions_in_flight = 0;
@@ -2253,6 +2366,9 @@ async fn run_host(
                 m.ports.clear();
                 m.ports_reading.clear();
                 m.ports_read_completions = 0;
+                m.program_resume.clear();
+                m.program_resume_reading.clear();
+                m.program_resume_unsupported = false;
                 m.activity_epoch += 1;
                 m.activity_reading = true;
                 m.activity_incomplete = false;
@@ -2260,6 +2376,7 @@ async fn run_host(
             let mut state = ControlState { prompts_enabled, ..Default::default() };
             let mut sweep = status_sweep::Reader::default();
             let mut downloads = downloads::Downloads::default();
+            let mut inputs = input::Queue::new(shared.model.lock().expect("host model").rtt.clone());
             let mut busy_since = Some(Instant::now());
             let boot = bootstrap_request(wanted.as_deref(), create.is_some(), workers.values().map(|w| w.session.clone()));
             let started = Instant::now();
@@ -2276,6 +2393,7 @@ async fn run_host(
                     return Err(error);
                 }
             };
+            if inputs.rtt.enabled() { inputs.rtt.record(started.elapsed()); }
             apply_bootstrap(shared, &mut state, reply, started);
             if let Some((label, shell)) = create.take() {
                 // Take before calling: an uncertain response must never create twice.
@@ -2331,11 +2449,13 @@ async fn run_host(
             shared.status("Connected", true);
             reconcile(&endpoint, shared, &sender, &mut workers);
             for (block, worker) in &workers {
-                if let Some((cols, rows, w, h)) = worker.size { resize(&mut control, &worker.session, block, cols, rows, w, h).await?; }
+                if let Some((cols, rows, w, h)) = worker.size {
+                    resize(&mut control, &worker.session, block, cols, rows, w, h).await?;
+                }
             }
             reconcile(&endpoint, shared, &sender, &mut workers);
-            declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-            query_activity(&mut control, shared, &mut state).await;
+            declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await?;
+            query_activity(&mut control, shared, &mut state, &mut deferred_events).await?;
             // Restore terminal sizes and state before a best-effort keymap can wait.
             if let Some(declaration) = &keymap { keymap::refresh(&mut control, shared, declaration).await; }
             server_reads.start(&mut control).await?;
@@ -2348,8 +2468,14 @@ async fn run_host(
             let mut pace = tokio::time::interval(prefetch::PACE);
             pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut expiry = tokio::time::interval(Duration::from_millis(100));
+            let mut metadata_due = false;
             loop {
                 let exclusive = state.actions.exclusive();
+                if metadata_due && !exclusive && inputs.in_flight() == 0 {
+                    declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await?;
+                    query_activity(&mut control, shared, &mut state, &mut deferred_events).await?;
+                    metadata_due = false;
+                }
                 state.performs_since = state.performs_since.or(busy_since.take());
                 if !exclusive && (state.performs_since.is_some() || !deferred_events.is_empty()) {
                     // Buffered requests share the busy step's start, even when it took less
@@ -2377,14 +2503,16 @@ async fn run_host(
                         .await?;
                         state.prune(&shared.model.lock().expect("host model"));
                         reconcile(&endpoint, shared, &sender, &mut workers);
-                        declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-                        query_activity(&mut control, shared, &mut state).await;
+                        metadata_due = true;
                         continue;
                     }
                     state.performs_since = None;
                 }
                 if !exclusive && state.ports_reads.can_pump() {
                     state.ports_reads.pump(&mut control, shared).await?;
+                }
+                if !exclusive && state.resume_reads.can_pump() {
+                    state.resume_reads.pump(&mut control, shared).await?;
                 }
                 let next = (!exclusive).then(|| status_sweep::next(shared, &state)).flatten();
                 let out = sweep.in_flight() + usize::from(prefetch.in_flight());
@@ -2403,12 +2531,18 @@ async fn run_host(
                     }
                     None => None,
                 };
+                let queued_ready = !exclusive && deferred_commands.front().is_some_and(|c| inputs.admits(c, shared));
+                let blocked_front = !queued_ready && !deferred_commands.is_empty();
                 tokio::select! {
                     _ = expiry.tick() => {
+                        shared.wake.flush_due();
                         state.prompts.expire(shared);
                         if exclusive { continue; }
                         busy_since = Some(Instant::now());
                         perform::expire(&mut control, shared).await?;
+                    }
+                    result = inputs.finished(shared), if inputs.in_flight() > 0 => {
+                        result?;
                     }
                     result = state.actions.finished(shared) => {
                         if let Err(error) = result {
@@ -2477,6 +2611,10 @@ async fn run_host(
                     finished = state.ports_reads.finished(), if !exclusive && state.ports_reads.in_flight() > 0 => {
                         ports::record_reply(shared, &mut state, finished);
                         state.ports_reads.pump(&mut control, shared).await?;
+                    }
+                    finished = state.resume_reads.finished(), if !exclusive && state.resume_reads.in_flight() > 0 => {
+                        program_resume::record_reply(shared, &mut state, finished);
+                        state.resume_reads.pump(&mut control, shared).await?;
                     }
                     reply = server_reads.finished(), if !exclusive && server_reads.in_flight() => server_info::record(shared, reply),
                     reply = hosts_reads.finished(), if !exclusive && hosts_reads.in_flight() => hosts::record(shared, reply),
@@ -2564,18 +2702,17 @@ async fn run_host(
                         .await?;
                         state.prune(&shared.model.lock().expect("host model"));
                         reconcile(&endpoint, shared, &sender, &mut workers);
-                        declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-                        query_activity(&mut control, shared, &mut state).await;
+                        metadata_due = true;
                     }
                     error = crate::ssh::closed(&mut tunnel) => return Err(error),
                     command = async {
-                        if !exclusive && let Some(command) = deferred_commands.pop_front() {
-                            Ok(command)
+                        if queued_ready {
+                            Ok(deferred_commands.pop_front().expect("ready front"))
                         } else {
                             commands.recv_async().await
                         }
                     } => {
-                        let Ok(command) = command else { control.close().await?; return Ok(true); };
+                        let Ok(mut command) = command else { control.close().await?; return Ok(true); };
                         if matches!(command, HostCommand::Shutdown) { control.close().await?; return Ok(true); }
                         if matches!(command, HostCommand::Reconnect) { return Ok(false); }
                         if let HostCommand::Prompts(enabled) = command {
@@ -2588,11 +2725,30 @@ async fn run_host(
                             state.prompts.answer(&mut control, shared, epoch, call_id, answer).await?;
                             continue;
                         }
-                        if exclusive {
+                        if let HostCommand::Visibility(visible) = command {
+                            if exclusive {
+                                deferred_commands.push_back(HostCommand::Visibility(visible));
+                            } else {
+                                apply_visibility(
+                                    visible,
+                                    &endpoint,
+                                    shared,
+                                    &sender,
+                                    &mut workers,
+                                    &mut state,
+                                );
+                                metadata_due = true;
+                            }
+                            continue;
+                        }
+                        if exclusive || blocked_front || !inputs.admits(&command, shared) {
                             deferred_commands.push_back(command);
                             continue;
                         }
-                        busy_since = Some(Instant::now());
+                        let command_started = Instant::now();
+                        if !matches!(command, HostCommand::Terminal { .. }) {
+                            busy_since = Some(command_started);
+                        }
                         if let HostCommand::Action { generation, request } = command {
                             state.prompts.expire(shared);
                             let prompt_deadline = state.prompts.deadline();
@@ -2691,8 +2847,7 @@ async fn run_host(
                             }
                             state.prune(&shared.model.lock().expect("host model"));
                             reconcile(&endpoint, shared, &sender, &mut workers);
-                            declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-                            query_activity(&mut control, shared, &mut state).await;
+                            metadata_due = true;
                             continue;
                         }
                         if let HostCommand::Keymap(new) = command {
@@ -2759,6 +2914,12 @@ async fn run_host(
                             }
                             continue;
                         }
+                        if let HostCommand::WatchProgramResume { epoch, session } = command {
+                            if epoch == shared.model.lock().expect("host model").connection_epoch {
+                                program_resume::watch(&mut control, shared, &mut state, session).await?;
+                            }
+                            continue;
+                        }
                         if let HostCommand::PutSharedHost { id, epoch, host } = command {
                             hosts::execute_put(&mut control, shared, &mut hosts_reads, id, epoch, host).await?;
                             continue;
@@ -2808,20 +2969,56 @@ async fn run_host(
                         ) {
                             preferred = None;
                         }
+                        if let HostCommand::Terminal { session, block, command } = &mut command {
+                            coalesce_terminal_command(
+                                session,
+                                block,
+                                command,
+                                &mut deferred_commands,
+                                &commands,
+                            );
+                        }
                         let navigation = match &command { HostCommand::Navigate { id, .. } => Some(*id), _ => None };
-                        let outcome = handle_command(command, &mut control, shared, &mut workers, &mut state, &mut sweep, &mut theme).await;
-                        ports::reconcile_selected(shared, &mut state);
+                        let outcome = handle_command(
+                            command,
+                            &mut control,
+                            shared,
+                            &mut workers,
+                            &mut state,
+                            &mut sweep,
+                            &mut inputs,
+                            &mut theme,
+                        )
+                        .await;
                         if let Some(id) = navigation {
                             shared.update(|m| m.navigation_result = Some((id, outcome.is_ok())));
                         }
-                        if let Err(error) = outcome {
-                            shared.update(|m| m.notice = Some(format!("{error:#}")));
-                            if !matches!(error.downcast_ref::<rexrs::Error>(), Some(rexrs::Error::Api(_))) { return Err(error); }
+                        let effect = match outcome {
+                            Ok(effect) => effect,
+                            Err(error) => {
+                                shared.update(|m| m.notice = Some(format!("{error:#}")));
+                                if !matches!(error.downcast_ref::<rexrs::Error>(), Some(rexrs::Error::Api(_))) { return Err(error); }
+                                CommandEffect::Full
+                            }
+                        };
+                        if effect != CommandEffect::None
+                            || command_started.elapsed() >= Duration::from_millis(5)
+                        {
+                            busy_since = Some(command_started);
                         }
-                        state.prune(&shared.model.lock().expect("host model"));
-                        reconcile(&endpoint, shared, &sender, &mut workers);
-                        declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-                        query_activity(&mut control, shared, &mut state).await;
+                        match effect {
+                            CommandEffect::None => {}
+                            CommandEffect::Claimed => {
+                                metadata_due = true;
+                            }
+                            CommandEffect::Full => {
+                                ports::reconcile_selected(shared, &mut state);
+                                program_resume::reconcile_selected(shared, &mut state);
+                                state.prune(&shared.model.lock().expect("host model"));
+                                reconcile(&endpoint, shared, &sender, &mut workers);
+                                metadata_due = true;
+                            }
+                        }
                     }
                 }
             }
@@ -2936,9 +3133,9 @@ async fn run_host(
                         let _ = worker.commands.send(DataCommand::Selection(input));
                     }
                 }
-                HostCommand::Terminal { block, command: Command::Resize(a,b,c,d), .. } if in_backoff => {
-                    if let Some(worker) = workers.get_mut(&block) {
-                        worker.size = Some((a,b,c,d));
+                HostCommand::Terminal { block, command, .. } if in_backoff && matches!(command.untracked(), Command::Resize(..)) => {
+                    if let (Some(worker),Command::Resize(a,b,c,d)) = (workers.get_mut(&block),command.untracked()) {
+                        worker.size = Some((*a,*b,*c,*d));
                     }
                 }
                 HostCommand::Terminal { block, command, .. }
@@ -2979,6 +3176,7 @@ async fn run_host(
                 | HostCommand::FetchView { .. }
                 | HostCommand::WatchPorts { .. }
                 | HostCommand::ReadPorts { .. }
+                | HostCommand::WatchProgramResume { .. }
                 | HostCommand::DownloadConfirm(_)
                 | HostCommand::DownloadCancel(_) => {}
                 _ if in_backoff => shared.update(|m| {
@@ -3178,6 +3376,76 @@ async fn undo_close(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandEffect {
+    /// Local pane forwarding or terminal input/resize: no layout or metadata changed.
+    None,
+    /// Input took size ownership of a block, which may make it newly eligible for `set_theme`.
+    Claimed,
+    /// Command may have changed sessions, views, workers, themes, or unqueried blocks.
+    Full,
+}
+
+fn is_mouse_motion(payload: &Value) -> bool {
+    payload["action"].as_str() == Some("motion")
+}
+
+/// Collapse consecutive queued `Resize` or identical-button/mods `Mouse(motion)` events for the
+/// same pane so a slow link never replays stale intermediate drag/resize states. Never reorders
+/// across any other command.
+fn coalesce_terminal_command(
+    session: &str,
+    block: &str,
+    command: &mut Command,
+    deferred: &mut VecDeque<HostCommand>,
+    incoming: &flume::Receiver<HostCommand>,
+) {
+    let coalescable = matches!(command.untracked(), Command::Resize(..))
+        || matches!(command, Command::Mouse(payload) if is_mouse_motion(payload));
+    if !coalescable {
+        return;
+    }
+    loop {
+        if deferred.is_empty() {
+            let Ok(next) = incoming.try_recv() else {
+                break;
+            };
+            deferred.push_back(next);
+        }
+        let Some(HostCommand::Terminal {
+            session: next_session,
+            block: next_block,
+            command: next,
+        }) = deferred.front()
+        else {
+            break;
+        };
+        if next_session != session || next_block != block {
+            break;
+        }
+        let matches_next = match (command.untracked(), next.untracked()) {
+            // Keep the last receipt when collapsing tracked resizes. Do not drop a receipt
+            // in favour of an untracked resize after the preference was switched off.
+            (Command::Resize(..), Command::Resize(..)) => {
+                !matches!(command, Command::EchoReset(_)) || matches!(next, Command::EchoReset(_))
+            }
+            (Command::Mouse(current), Command::Mouse(next_payload)) => {
+                is_mouse_motion(next_payload)
+                    && next_payload.get("button") == current.get("button")
+                    && next_payload.get("mods") == current.get("mods")
+            }
+            _ => false,
+        };
+        if !matches_next {
+            break;
+        }
+        if let Some(HostCommand::Terminal { command: newer, .. }) = deferred.pop_front() {
+            *command = newer;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     command: HostCommand,
     control: &mut Client,
@@ -3185,8 +3453,9 @@ async fn handle_command(
     workers: &mut HashMap<String, PaneWorker>,
     state: &mut ControlState,
     sweep: &mut status_sweep::Reader,
+    inputs: &mut input::Queue,
     theme: &mut Option<SetTheme>,
-) -> Result<()> {
+) -> Result<CommandEffect> {
     match command {
         HostCommand::PerformReply {
             epoch,
@@ -3197,12 +3466,11 @@ async fn handle_command(
                 perform::reply(control, &call_id, &outcome).await?;
             }
         }
-        HostCommand::Visibility(visible) => shared.update(|m| m.visible = visible),
         // Declared to every block it is due for right after this command.
         HostCommand::Theme(new) => *theme = new,
         HostCommand::Claim { session, blocks } => {
             if blocks.is_empty() {
-                return Ok(());
+                return Ok(CommandEffect::Full);
             }
             let Ok(result) = request(
                 control,
@@ -3211,7 +3479,7 @@ async fn handle_command(
             )
             .await
             else {
-                return Ok(());
+                return Ok(CommandEffect::Full);
             };
             shared.update(|m| {
                 for b in result["blocks"].as_array().into_iter().flatten() {
@@ -3361,7 +3629,7 @@ async fn handle_command(
                 if reply.send(Ok(ticket)).is_ok() {
                     shared.update(|m| m.protocol.bundled_tickets_used += 1);
                 }
-                return Ok(());
+                return Ok(CommandEffect::Full);
             }
             shared.update(|m| m.protocol.data_connect_requests += 1);
             let result = request(control, "data.connect", json!({"session_id":session,"block_id":block,"data_ref_id":"terminal","subprotocol":wire::PROTOCOL})).await;
@@ -3382,36 +3650,55 @@ async fn handle_command(
             command,
         } => {
             let Some(worker) = workers.get_mut(&block) else {
-                return Ok(());
+                return Ok(CommandEffect::None);
+            };
+            let (command, receipt) = match command {
+                Command::EchoReset(tracked) => {
+                    let (command, receipt) = *tracked;
+                    (command, Some(receipt))
+                }
+                command => (command, None),
             };
             match command {
                 Command::Selection(input) => {
                     let _ = worker.commands.send(DataCommand::Selection(input));
+                    return Ok(CommandEffect::None);
                 }
                 Command::CopyMode(input) => {
                     let _ = worker.commands.send(DataCommand::CopyMode(input));
+                    return Ok(CommandEffect::None);
                 }
                 Command::Resize(cols, rows, w, h) => {
                     worker.size = Some((cols, rows, w, h));
                     resize(control, &session, &block, cols, rows, w, h).await?;
+                    if let Some(receipt) = receipt {
+                        receipt.complete();
+                    }
+                    return Ok(CommandEffect::None);
                 }
                 Command::Scroll(delta) => {
                     let _ = worker.commands.send(DataCommand::Scroll(delta));
+                    return Ok(CommandEffect::None);
                 }
                 Command::Search(needle) => {
                     let _ = worker.commands.send(DataCommand::Search(needle));
+                    return Ok(CommandEffect::None);
                 }
                 Command::SearchStep(older) => {
                     let _ = worker.commands.send(DataCommand::SearchStep(older));
+                    return Ok(CommandEffect::None);
                 }
                 Command::CursorStyle(shape) => {
                     let _ = worker.commands.send(DataCommand::CursorStyle(shape));
+                    return Ok(CommandEffect::None);
                 }
                 Command::PromptStep(older) => {
                     let _ = worker.commands.send(DataCommand::PromptStep(older));
+                    return Ok(CommandEffect::None);
                 }
                 Command::Reconnect => {
                     let _ = worker.commands.send(DataCommand::Reconnect);
+                    return Ok(CommandEffect::None);
                 }
                 // Neither is input: the block is not claimed. A refusal becomes the host's
                 // notice and a transport failure reconnects; either way it is not sent again.
@@ -3426,6 +3713,9 @@ async fn handle_command(
                         json!({"session_id":session,"block_id":block,"args":{}}),
                     )
                     .await?;
+                    if let Some(receipt) = receipt {
+                        receipt.complete();
+                    }
                     // The history the view may have been scrolled into is gone.
                     let _ = worker.commands.send(DataCommand::Bottom);
                 }
@@ -3433,24 +3723,17 @@ async fn handle_command(
                     let (connected, owner) = {
                         let m = shared.model.lock().expect("host model");
                         let Some(connection) = m.terminals.get(&block) else {
-                            return Ok(());
+                            return Ok(CommandEffect::None);
                         };
                         let m = connection.model.lock().expect("terminal model");
                         (m.connected && m.control_connected, m.owner)
                     };
                     if !connected {
-                        return Ok(());
+                        return Ok(CommandEffect::None);
                     }
                     // Releases, pointer motion and wheel turns never claim the block; presses do.
-                    let passive = match &input {
-                        Command::Key(key)
-                        | Command::KeyWithPrefix { key, .. }
-                        | Command::SendKey(key) => key["action"] == "release",
-                        Command::Mouse(mouse) => mouse["action"] != "press",
-                        Command::Wheel(_) => true,
-                        _ => false,
-                    };
-                    if !owner && !passive {
+                    let claimed = !owner && !input::passive(&input).unwrap_or(false);
+                    if claimed {
                         let result = request(
                             control,
                             "session.own_block",
@@ -3498,37 +3781,21 @@ async fn handle_command(
                             .expect("terminal model")
                             .input_events += 1;
                     }
-                    match input {
-                        Command::Key(key) => {
-                            request(
-                                control,
-                                "client.key",
-                                json!({"session_id":session,"block_id":block,"key":key}),
-                            )
+                    if let Some((method, payload)) = input::wire_request(&session, &block, input) {
+                        inputs
+                            .send(control, shared, method, payload, receipt)
                             .await?;
-                        }
-                        Command::KeyWithPrefix { key, prefix } => {
-                            request(control, "client.key", json!({"session_id":session,"block_id":block,"key":key,"prefix":prefix})).await?;
-                        }
-                        Command::SendKey(key) => {
-                            request(control, "block.event", json!({"session_id":session,"block_id":block,"event":{"type":"key","payload":key}})).await?;
-                        }
-                        Command::Paste(text) => {
-                            request(control, "block.event", json!({"session_id":session,"block_id":block,"event":{"type":"paste","payload":{"text":text}}})).await?;
-                        }
-                        Command::Mouse(payload) => {
-                            request(control, "block.event", json!({"session_id":session,"block_id":block,"event":{"type":"mouse","payload":payload}})).await?;
-                        }
-                        Command::Wheel(payload) => {
-                            request(control, "block.event", json!({"session_id":session,"block_id":block,"event":{"type":"wheel","payload":payload}})).await?;
-                        }
-                        Command::TakeControl => {}
-                        _ => unreachable!(),
                     }
+                    return Ok(if claimed {
+                        CommandEffect::Claimed
+                    } else {
+                        CommandEffect::None
+                    });
                 }
             }
         }
         HostCommand::ListDir(_)
+        | HostCommand::Visibility(_)
         | HostCommand::Action { .. }
         | HostCommand::Prompts(_)
         | HostCommand::PromptReply { .. }
@@ -3544,6 +3811,7 @@ async fn handle_command(
         | HostCommand::WatchSharedHosts
         | HostCommand::WatchPorts { .. }
         | HostCommand::ReadPorts { .. }
+        | HostCommand::WatchProgramResume { .. }
         | HostCommand::PutSharedHost { .. }
         | HostCommand::RemoveSharedHost { .. }
         | HostCommand::Download(_)
@@ -3553,7 +3821,7 @@ async fn handle_command(
             unreachable!()
         }
     }
-    Ok(())
+    Ok(CommandEffect::Full)
 }
 
 /// The theme a block this client creates starts with, unless the server refused themes.
@@ -3591,6 +3859,21 @@ fn fail_copy_mode(
     });
 }
 
+fn sample_echo_facts<E>(
+    rtt: &Rtt,
+    frame: &mut Frame,
+    position: u64,
+    ack: u64,
+    screen: impl FnOnce() -> Result<ghostty_vt::screen::Screen, E>,
+) -> Result<(), E> {
+    if rtt.enabled() {
+        frame.alt_screen = screen()? == ghostty_vt::screen::Screen::Alternate;
+        frame.output_position = position;
+        frame.acked_input = ack;
+    }
+    Ok(())
+}
+
 async fn run_data(
     endpoint: String,
     session: String,
@@ -3599,6 +3882,7 @@ async fn run_data(
     commands: flume::Receiver<DataCommand>,
     shared: PaneShared,
 ) {
+    let rtt = shared.model.lock().expect("terminal model").rtt.clone();
     let mut welcome: Option<wire::Welcome> = None;
     let mut stream: Option<TerminalStream> = None;
     let mut selection = None;
@@ -3652,13 +3936,22 @@ async fn run_data(
             let stream = stream.as_mut().context("terminal stream")?;
             let selection = selection.as_mut().context("selection controller")?;
             let mut pending_copy_search: Option<PendingCopySearch> = None;
+            let mut ack_slot: Option<Arc<AtomicU64>> = None;
+            let mut output_ack = 0;
             let mut dirty = true;
             let mut tick = tokio::time::interval(Duration::from_millis(16));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     bytes = wire::next_binary(&mut socket) => {
-                        if let Err(error) = stream.feed(&bytes?) { welcome = None; return Err(error); }
+                        let bytes = bytes?;
+                        if !bytes.is_empty() && rtt.enabled() {
+                            // Stamp at receipt. A delayed render or local redraw after the ack
+                            // must not turn pre-ack data into a post-ack frame.
+                            let slot = ack_slot.get_or_insert_with(|| shared.model.lock().expect("terminal model").input_acks.slot());
+                            output_ack = slot.load(Ordering::Acquire);
+                        }
+                        if let Err(error) = stream.feed(&bytes) { welcome = None; return Err(error); }
                         dirty = true;
                     }
                     command = commands.recv_async() => match command {
@@ -3841,7 +4134,9 @@ async fn run_data(
                                 fail_copy_mode(&mut copy_mode, &shared, error);
                             }
                             let mut frame = renderer.frame(terminal)?;
-                            if terminal.is_viewport_active()? { prompt_anchor = false; }
+                            frame.viewport_active = terminal.is_viewport_active()?;
+                            if frame.viewport_active { prompt_anchor = false; }
+                            sample_echo_facts(&rtt, &mut frame, stream.received, output_ack, || terminal.active_screen())?;
                             frame.prompt_anchor = prompt_anchor;
                             frame.selection_revision = selection_revision;
                             frame.copy = match copy_mode.view(terminal) {
@@ -3855,12 +4150,12 @@ async fn run_data(
                                 Ok(results) => results,
                                 Err(error) => { search = Default::default(); shared.update(|m| m.notice = Some(format!("Search failed: {error:#}"))); None }
                             };
-                            let frame = Arc::new(frame);
                             let yank = pending_yank.take();
                             let ended = copy_mode.ended_epoch();
                             let mut transitioned = false;
                             shared.update(|m| {
-                                m.frame = Some(frame);
+                                frame.stream_epoch = m.stream_epoch;
+                                m.frame = Some(Arc::new(frame));
                                 if let Some(yank) = yank {
                                     m.copy_yank = Some(yank);
                                 }
@@ -3870,7 +4165,7 @@ async fn run_data(
                                 if !m.connected { m.connected = true; m.status = "Live · snapshot restored".into(); transitioned = true; }
                                 if let Some(code) = stream.exit_code { m.status = format!("Process exited · {code}"); }
                             });
-                            if transitioned { let _ = shared.host_wake.try_send(()); }
+                            if transitioned { shared.host_wake.notify(); }
                             dirty = search_pending;
                         } else {
                             dirty = false;

@@ -16,6 +16,8 @@ fn key(rt: &mut Runtime<Workspace>, code: Code, event: KeyEvent, pressed: bool, 
             mods: event.mods,
             pressed,
             repeat,
+            text: None,
+            consumed_mods: Mods::default(),
         },
         event,
         None,
@@ -590,7 +592,7 @@ fn unbound_ctrl_tab_press_and_release_are_forwarded() {
     let mut rt = runtime(ws);
     key(&mut rt, Code::Tab, ctrl(Key::Tab), true, false);
     assert!(
-        rt.state.forwarded.contains(
+        rt.state.forwarded.contains_key(
             &Input {
                 event: &ctrl(Key::Tab),
                 code: Some(Code::Tab),
