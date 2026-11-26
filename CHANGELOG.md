@@ -6,6 +6,12 @@
 
 - Lowered the minimum negotiated Rex Server API revision from 10 to 0 (now 0 through 24, matching the official `rex` CLI floor). Added revision-0 `session.new_split` `anchor_block_id` translation, gated `server.stop` on API revision 4 or newer, gated `session.bootstrap` bundled `data_tickets` on API revision 8 or newer (falling back to `data.connect` on revisions 0 through 7), and fixed API revision `0` and `0–24` range reporting on Server, About, version, and debug info views. [Compatibility record](docs/server-api24.md).
 
+### Fixed
+
+- Use the system hostname for the local host and repair blank saved host labels. Thanks to @satyamjay-iitd (#191).
+- Keep a removed local host off the saved list. `--session` and `--new` use the last active saved host unless `--endpoint` or `REX_SERVER` overrides it. Thanks to @nemofq (#190).
+- Keep a lone tiled pane edge to edge when a floating pane opens above it. Thanks to @LoricAndre (#193).
+
 ## 0.13.0 - 2026-11-25
 
 Rex Server API revision 24 support (`0.1.0-snapshot.2670`) with read-only OSC 7577 Program Resume inspection, interactive `rex.ui` script prompts (`#144`), API 20 Undo close, API 15 listening TCP ports, API 19 server-side focus history, upstream Rune `983e33b9` upgrade, pipelined high-latency terminal input (`#179`), opt-in render-only local echo (`#180`), and throttled hidden-tab title redraws (`#181`).
