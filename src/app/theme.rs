@@ -140,6 +140,23 @@ pub static GRUVBOX_DARK: Palette = Palette {
     kit: OnceLock::new(),
 };
 
+/// Tokyo Night's dark variant; secondary text is lifted for readable chrome labels.
+pub static TOKYO_NIGHT: Palette = Palette {
+    ground: 0x1a1b26,
+    card: 0x1a1b26,
+    popover: 0x24283b,
+    ink: 0xc0caf5,
+    muted: 0x9aa5ce,
+    accent: 0x7aa2f7,
+    accent2: 0xbb9af7,
+    live: 0x9ece6a,
+    warning: 0xe0af68,
+    danger: 0xf7768e,
+    on_accent: 0x1a1b26,
+    terminal_selection: 0x283457,
+    kit: OnceLock::new(),
+};
+
 /// The palette a chrome theme draws in.
 pub fn palette_of(chrome: ChromeTheme) -> &'static Palette {
     match chrome {
@@ -147,6 +164,7 @@ pub fn palette_of(chrome: ChromeTheme) -> &'static Palette {
         ChromeTheme::RosePine => &ROSE_PINE,
         ChromeTheme::RosePineMoon => &ROSE_PINE_MOON,
         ChromeTheme::GruvboxDark => &GRUVBOX_DARK,
+        ChromeTheme::TokyoNight => &TOKYO_NIGHT,
     }
 }
 

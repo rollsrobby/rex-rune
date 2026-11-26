@@ -760,6 +760,7 @@ fn holding_session_tab_navigation_sends_three_focus_requests() {
         let sent = requests(&rx);
         assert_eq!(sent.len(), 3, "{sent:?}");
         assert!(sent.iter().all(|r| r.0 == method), "{sent:?}");
+        assert!(sent.iter().all(|r| r.2["wrap"] == true), "{sent:?}");
     }
 }
 
