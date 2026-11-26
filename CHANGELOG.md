@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.13.0 - 2026-11-25
+
+Rex Server API revision 24 support (`0.1.0-snapshot.2670`) with read-only OSC 7577 Program Resume inspection, interactive `rex.ui` script prompts (`#144`), API 20 Undo close, API 15 listening TCP ports, API 19 server-side focus history, upstream Rune `983e33b9` upgrade, pipelined high-latency terminal input (`#179`), opt-in render-only local echo (`#180`), and throttled hidden-tab title redraws (`#181`).
+
 ### Added
 
 - **Program resume (Rex Server API 24).** Open **Show program resume…** in Commands or **Program resume…** in the pane menu to see reported programs, Rex's chosen record, and trust reasons. Snapshot 2670 resumes trusted chosen programs with server restore enabled. The view never shows, copies or runs launch arguments.
@@ -29,6 +33,8 @@
 - Animated terminal titles no longer redraw the workspace on every change. Switching tabs or hosts still shows the latest title immediately. [#181](https://github.com/shuv1337/rex-rune/issues/181), reported by @samth.
 
 - **Lua actions no longer stall their own prompt.** The control worker keeps listening for `rex.ui` while `client.action` is pending, so it can decline or answer immediately and still apply the action's eventual response.
+
+- Cached session view labels stay in sync with `session.list` even if a rename event is dropped. Unix socket and SSH agent probes report clearer messages instead of raw OS errors ([#170](https://github.com/shuv1337/rex-rune/pull/170)).
 
 ## 0.12.0 - 2026-11-24
 
