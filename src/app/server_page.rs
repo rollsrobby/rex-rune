@@ -40,14 +40,22 @@ pub(super) fn uptime(
     })
 }
 
+fn endpoint_supports_stop(endpoint: &str) -> bool {
+    endpoint.starts_with("unix://") || endpoint.starts_with("ssh://")
+}
+
 impl Workspace {
     pub fn can_stop_server(&self) -> bool {
-        self.hosts
+        self.hosts.get(self.active).is_some_and(|h| {
+            h.model.connected
+                && h.model
+                    .protocol
+                    .api_revision_at_least(rex_rune::connection::STOP_SERVER_MIN_API_REVISION)
+        }) && self
+            .settings
+            .hosts
             .get(self.active)
-            .is_some_and(|h| h.model.connected)
-            && self.settings.hosts.get(self.active).is_some_and(|h| {
-                h.endpoint.starts_with("unix://") || h.endpoint.starts_with("ssh://")
-            })
+            .is_some_and(|h| endpoint_supports_stop(&h.endpoint))
     }
 
     pub fn stop_server(&mut self) {
@@ -134,14 +142,22 @@ fn controls(s: &Workspace) -> El {
     if let Some(duration) = duration {
         rows.push(fact("Running for", duration, None));
     }
+    let connected = s.hosts.get(s.active).is_some_and(|h| h.model.connected);
+    let local_or_ssh = s
+        .settings
+        .hosts
+        .get(s.active)
+        .is_some_and(|h| endpoint_supports_stop(&h.endpoint));
     rows.push(kit::setting(
         "Stop server…",
         if s.can_stop_server() {
             "Ends every program in this server’s sessions."
-        } else if !s.hosts[s.active].model.connected {
+        } else if !connected {
             "Available while this host is connected over its Unix socket or SSH."
-        } else {
+        } else if !local_or_ssh {
             "A server can be stopped only from its own machine or over SSH."
+        } else {
+            "Requires Rex Server API revision 4 or newer."
         },
         if s.can_stop_server() {
             button("server-stop", "Stop server…", Pill::Danger, |s, _| {
@@ -308,10 +324,11 @@ pub fn section(s: &Workspace) -> El {
     let build_text = |value: Option<&str>| value.unwrap_or(b_missing).to_owned();
     let api = if !model.connected {
         "Not connected".into()
-    } else if model.protocol.api_revision == 0 {
-        MISSING.into()
     } else {
-        model.protocol.api_revision.to_string()
+        match model.protocol.api_revision {
+            Some(rev) => rev.to_string(),
+            None => MISSING.into(),
+        }
     };
     let build = kit::section(
         "Server build",

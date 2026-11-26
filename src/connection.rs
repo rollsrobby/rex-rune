@@ -359,11 +359,19 @@ pub struct Connection {
 
 #[derive(Clone, Default)]
 pub struct ProtocolStats {
-    pub api_revision: u32,
+    /// The API revision negotiated on the current connection, or `None` while disconnected.
+    pub api_revision: Option<u32>,
     pub bootstrap_requests: u64,
     pub attach_requests: u64,
     pub bundled_tickets_used: u64,
     pub data_connect_requests: u64,
+}
+
+impl ProtocolStats {
+    /// Whether the current connection negotiated at least `min`.
+    pub fn api_revision_at_least(&self, min: u32) -> bool {
+        self.api_revision.is_some_and(|rev| rev >= min)
+    }
 }
 
 /// What the person is told when the server took a stop request.
@@ -639,9 +647,23 @@ impl HostModel {
     }
 }
 
+const SPLIT_ANCHOR_ID_MIN_API_REVISION: u32 = 1;
+pub const STOP_SERVER_MIN_API_REVISION: u32 = 4;
+const BOOTSTRAP_DATA_TICKETS_MIN_API_REVISION: u32 = 8;
 pub const UNDO_CLOSE_MIN_API_REVISION: u32 = 20;
 pub const UNDO_CLOSE_REQUIRES_API: &str = "Requires Rex Server API 20 or later";
 pub const UNDO_CLOSE_DISCONNECTED: &str = "Connect to the host to undo a close";
+
+fn translate_request_for_revision(revision: u32, method: &str, payload: &mut Value) {
+    if revision < SPLIT_ANCHOR_ID_MIN_API_REVISION
+        && method == "session.new_split"
+        && let Some(object) = payload.as_object_mut()
+        && !object.contains_key("anchor_block_id")
+        && let Some(anchor) = object.remove("anchor_id")
+    {
+        object.insert("anchor_block_id".into(), anchor);
+    }
+}
 
 /// Only the close methods that accept `undoable`. Probes and automated requests use `Request`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1052,6 +1074,7 @@ fn bootstrap_request(
     wanted: Option<&str>,
     creating: bool,
     retained: impl Iterator<Item = String>,
+    bundle_tickets: bool,
 ) -> session::Bootstrap {
     let mut ids: Vec<_> = retained.collect();
     if let Some(id) = wanted.filter(|s| session_id(s)) {
@@ -1059,11 +1082,14 @@ fn bootstrap_request(
     }
     ids.sort();
     ids.dedup();
-    let request = session::Bootstrap::new("all").data_tickets([session::BootstrapDataTicket::new(
-        "com.superlogical.terminal",
-        "terminal",
-    )
-    .subprotocol(wire::PROTOCOL)]);
+    let mut request = session::Bootstrap::new("all");
+    if bundle_tickets {
+        request = request.data_tickets([session::BootstrapDataTicket::new(
+            "com.superlogical.terminal",
+            "terminal",
+        )
+        .subprotocol(wire::PROTOCOL)]);
+    }
     if wanted.is_some() || creating || !ids.is_empty() {
         request.attach_session_ids(ids)
     } else {
@@ -1097,6 +1123,7 @@ impl Shared {
             m.status = status.into();
             m.connected = connected;
             if !connected {
+                m.protocol.api_revision = None;
                 m.rtt.clear();
                 self.wake.reset_titles();
                 m.clipboard = None;
@@ -2344,7 +2371,7 @@ async fn run_host(
                 m.view_fetches.clear();
                 m.focus_history_result = None;
                 m.client_id = identity.id.clone();
-                m.protocol.api_revision = control.welcome().api_revision;
+                m.protocol.api_revision = Some(control.welcome().api_revision);
                 m.server_info = server_info::ServerInfo::welcomed(control.welcome());
                 // A server is answering again, so "stop accepted" is no longer the news. A
                 // refusal or an unconfirmed stop stays: the person has not seen it resolved.
@@ -2378,7 +2405,12 @@ async fn run_host(
             let mut downloads = downloads::Downloads::default();
             let mut inputs = input::Queue::new(shared.model.lock().expect("host model").rtt.clone());
             let mut busy_since = Some(Instant::now());
-            let boot = bootstrap_request(wanted.as_deref(), create.is_some(), workers.values().map(|w| w.session.clone()));
+            let boot = bootstrap_request(
+                wanted.as_deref(),
+                create.is_some(),
+                workers.values().map(|w| w.session.clone()),
+                control.welcome().api_revision >= BOOTSTRAP_DATA_TICKETS_MIN_API_REVISION,
+            );
             let started = Instant::now();
             shared.update(|m| m.protocol.bootstrap_requests += 1);
             let mut deferred_events = VecDeque::new();
@@ -2762,6 +2794,16 @@ async fn run_host(
                         if let HostCommand::StopServer { epoch } = command {
                             if epoch != shared.model.lock().expect("host model").connection_epoch {
                                 shared.update(|m| m.notice = Some("Stop not sent: the connection changed. Review Stop server again.".into()));
+                                continue;
+                            }
+                            let rev = control.welcome().api_revision;
+                            if rev < STOP_SERVER_MIN_API_REVISION {
+                                shared.update(|m| {
+                                    m.notice = Some(format!(
+                                        "Stop server requires Rex Server API revision {STOP_SERVER_MIN_API_REVISION} or newer (this host negotiated revision {rev})."
+                                    ));
+                                    m.server_stop_result = m.notice.clone();
+                                });
                                 continue;
                             }
                             match request(&mut control, "server.stop", json!({})).await {
@@ -3579,7 +3621,7 @@ async fn handle_command(
             .await?
         }
         HostCommand::Close { .. } | HostCommand::Request { .. } => {
-            let (method, payload) = match command {
+            let (method, mut payload) = match command {
                 HostCommand::Close { kind, mut payload } => {
                     if control.welcome().api_revision >= UNDO_CLOSE_MIN_API_REVISION {
                         payload["undoable"] = json!(true);
@@ -3592,6 +3634,7 @@ async fn handle_command(
                 _ => unreachable!(),
             };
             let session_id = payload["session_id"].as_str().map(str::to_owned);
+            translate_request_for_revision(control.welcome().api_revision, &method, &mut payload);
             request(control, &method, payload).await?;
             let after_session = if method == "session.detach" {
                 if let Some(detached) = session_id.as_deref() {
@@ -3615,6 +3658,7 @@ async fn handle_command(
             if let Some(dir) = shell_dir_of(control, &session, &cwd_from).await {
                 crate::layout::with_cwd(&mut payload["layout"], &dir);
             }
+            translate_request_for_revision(control.welcome().api_revision, &method, &mut payload);
             // Creation is sent once. A failure follows the ordinary request path; never replay.
             request(control, &method, payload).await?;
             after_request(control, shared, workers, state, sweep, Some(&session)).await?;

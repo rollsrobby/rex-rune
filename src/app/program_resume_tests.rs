@@ -17,7 +17,7 @@ fn fixture() -> (Workspace, flume::Receiver<HostCommand>) {
     ws.settings.hosts[0].endpoint = "ssh://dev@buildbox/private/rex.sock".into();
     ws.settings.hosts[0].label = "Build box".into();
     let model = &mut ws.hosts[0].model;
-    model.protocol.api_revision = 24;
+    model.protocol.api_revision = Some(24);
     model.connection_epoch = 3;
     model.sessions[0].label = "Workbench".into();
     for (pane, name) in model
@@ -117,7 +117,7 @@ fn publish(ws: &mut Workspace, tx: &mut Tx) {
 #[test]
 fn commands_and_pane_menu_gate_reads_and_show_only_cached_detail() {
     let (mut ws, rx) = fixture();
-    ws.hosts[0].model.protocol.api_revision = 23;
+    ws.hosts[0].model.protocol.api_revision = Some(23);
     ws.picker(false);
     let commands = ws.entries();
     let command = commands
@@ -133,7 +133,7 @@ fn commands_and_pane_menu_gate_reads_and_show_only_cached_detail() {
     assert!(!ws.entries().iter().any(|e| e.label == "Program resume…"));
     assert!(watches(&rx).is_empty());
 
-    ws.hosts[0].model.protocol.api_revision = 24;
+    ws.hosts[0].model.protocol.api_revision = Some(24);
     ws.pane_menu("block:c".into(), None);
     assert_eq!(
         ws.entries()
@@ -160,6 +160,33 @@ fn commands_and_pane_menu_gate_reads_and_show_only_cached_detail() {
     assert_eq!(ws.panel.as_ref().unwrap().fields[0].1, "Filter programs…");
     assert_eq!(ws.entries()[0].group, "Build API");
     assert_eq!(watches(&rx), [(3, Some("s".into()))]);
+}
+
+#[test]
+fn disconnected_host_reports_disconnected_not_needs_api_24() {
+    let (mut ws, _rx) = fixture();
+    // Connected rev 24 -> disconnect clears api_revision to None.
+    ws.hosts[0].model.connected = false;
+    ws.hosts[0].model.protocol.api_revision = None;
+    assert_eq!(
+        ws.program_resume_blocked().as_deref(),
+        Some("Host is disconnected.")
+    );
+    ws.picker(false);
+    let command = ws
+        .entries()
+        .into_iter()
+        .find(|e| e.id.as_deref() == Some(ACTION))
+        .unwrap();
+    assert!(!command.enabled);
+    assert_eq!(command.detail, "Host is disconnected.");
+
+    // Even if an earlier rev 24 value lingered while disconnected, disconnected wins.
+    ws.hosts[0].model.protocol.api_revision = Some(24);
+    assert_eq!(
+        ws.program_resume_blocked().as_deref(),
+        Some("Host is disconnected.")
+    );
 }
 
 #[test]
