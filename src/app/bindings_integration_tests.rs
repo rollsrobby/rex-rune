@@ -584,6 +584,113 @@ fn settings_diagnostic_sets_toast_once_per_host_never_file_or_linux() {
 }
 
 #[test]
+fn copy_shortcut_forwards_both_edges_until_there_is_a_selection() {
+    check_copy_chord('c', Code::KeyC, "key_c", json!([]));
+}
+
+#[test]
+fn copy_override_shadows_new_tab_even_without_a_selection() {
+    check_copy_chord(
+        't',
+        Code::KeyT,
+        "key_t",
+        json!([{"keys":"ctrl+shift+t","action":"pane.copy"}]),
+    );
+}
+
+fn check_copy_chord(letter: char, code: Code, wire: &str, bindings: Value) {
+    let (mut ws, host) = tabbed_workspace("single");
+    overrides(&mut ws, bindings);
+    let (sender, sent) = flume::unbounded();
+    super::pane_verb_tests::framed_terminal(&mut ws, "block:a", &sender, b"alpha beta");
+    let mut rt = runtime(ws);
+    let clipboard = rune::clipboard::memory();
+    clipboard.set_text("keep");
+    rt.use_clipboard(&clipboard);
+    let tap_copy = |rt: &mut Runtime<Workspace>| {
+        let mut event = ctrl(Key::Command(letter));
+        event.mods.shift = true;
+        for down in [true, false] {
+            key(rt, code, event.clone(), down, false);
+        }
+    };
+    tap_copy(&mut rt);
+    assert!(requests(&host).is_empty(), "no shadowed tab action");
+    let keys = sent_keys(&sent);
+    assert_eq!(keys.len(), 2);
+    for (payload, edge) in keys.iter().zip(["press", "release"]) {
+        assert_eq!(payload["action"], edge);
+        assert_eq!(payload["key"], wire);
+        assert_eq!(payload["mods"], "shift+ctrl");
+    }
+    assert_eq!(
+        clipboard.text().as_deref().map(String::as_str),
+        Some("keep")
+    );
+
+    let grid = super::pane_verb_tests::rect(&rt, "grid:block:a");
+    let (width, height) = crate::app::term::metrics(rt.state.settings.font_size).cell;
+    let y = grid[1] + height / 2.;
+    rt.pointer_down(grid[0] + width * 0.5, y);
+    rt.pointer_move(grid[0] + width * 4.5, y);
+    rt.pointer_up(grid[0] + width * 4.5, y);
+    rt.frame(1. / 60.);
+    clipboard.set_text("before copy");
+    tap_copy(&mut rt);
+    assert_eq!(
+        clipboard.text().as_deref().map(String::as_str),
+        Some("alpha")
+    );
+    assert!(sent_keys(&sent).is_empty());
+    assert!(requests(&host).is_empty(), "only the local copy should run");
+}
+
+#[test]
+fn caps_remapped_to_escape_forwards_both_edges_to_the_terminal() {
+    let (mut ws, _rx) = tabbed_workspace("single");
+    let (sender, sent) = flume::unbounded();
+    live_terminal(&mut ws, "block:a", &sender);
+    let mut rt = runtime(ws);
+    let event = KeyEvent {
+        key: Key::Escape,
+        mods: Mods::default(),
+    };
+    for down in [true, false] {
+        key(&mut rt, Code::CapsLock, event.clone(), down, false);
+    }
+    let keys = sent_keys(&sent);
+    assert_eq!(keys.len(), 2);
+    for (payload, edge) in keys.iter().zip(["press", "release"]) {
+        assert_eq!(payload["action"], edge);
+        assert_eq!(payload["key"], "escape");
+    }
+}
+
+#[test]
+fn copy_sequence_keeps_both_chords_local_without_a_selection() {
+    let (mut ws, _rx) = tabbed_workspace("single");
+    overrides(&mut ws, json!([{"keys":"ctrl+b>c","action":"pane.copy"}]));
+    let (sender, sent) = flume::unbounded();
+    live_terminal(&mut ws, "block:a", &sender);
+    let mut rt = runtime(ws);
+    for (code, event) in [
+        (Code::KeyB, ctrl(Key::Command('b'))),
+        (
+            Code::KeyC,
+            KeyEvent {
+                key: Key::Text("c".into()),
+                mods: Mods::default(),
+            },
+        ),
+    ] {
+        for down in [true, false] {
+            key(&mut rt, code, event.clone(), down, false);
+        }
+    }
+    assert!(sent_keys(&sent).is_empty());
+}
+
+#[test]
 fn unbound_ctrl_tab_press_and_release_are_forwarded() {
     let (mut ws, _) = tabbed_workspace("single");
     overrides(&mut ws, json!([{"keys":"ctrl+tab","action":null}]));
