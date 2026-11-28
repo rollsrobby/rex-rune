@@ -90,6 +90,7 @@ pub struct Workspace {
     zoom_notice: Option<u64>,
     pub drag: Option<DividerDrag>,
     pub layer_drag: Option<super::floating_drag::LayerDrag>,
+    pub(super) rearrange: super::drag::State,
     pub copy_mode: Option<super::copy_mode::Session>,
     /// Keys whose press went to a terminal, and whether Option composed that press.
     pub forwarded: HashMap<super::bindings::Identity, bool>,
@@ -349,6 +350,7 @@ impl Workspace {
             zoom_notice: None,
             drag: None,
             layer_drag: None,
+            rearrange: Default::default(),
             copy_mode: None,
             forwarded: HashMap::new(),
             bindings: Default::default(),
@@ -551,6 +553,9 @@ impl Workspace {
     /// Forget a host's terminals and claims; dropping its `HostState` shuts its worker down.
     pub(super) fn forget_host(&mut self, state: HostState) {
         let id = state.id;
+        if self.downloads.dragging.is_some_and(|(host, _)| host == id) {
+            self.downloads.dragging = None;
+        }
         if self.copy_mode.as_ref().is_some_and(|s| s.key.0 == id) {
             self.copy_mode = None;
         }
@@ -596,7 +601,7 @@ impl Workspace {
         self.settings.sessions.remove(&host.endpoint);
         self.settings.recent_paths.remove(&host.endpoint);
         // Menus and drags name hosts by position, which just shifted.
-        self.panel = None;
+        drop(self.take_panel());
         self.drag = None;
         self.layer_drag = None;
         if self.active == index {
@@ -909,6 +914,7 @@ impl Workspace {
         self.deliver_program_notices(index, notices);
         self.sync_layer_menu(tx);
         self.sync_layer_drag();
+        self.sync_rearrange();
         if self
             .panel
             .as_ref()
@@ -990,6 +996,7 @@ impl Workspace {
         }
         if !focused {
             self.cancel_layer_drag();
+            self.cancel_rearrange();
             for term in self.terminals.values_mut() {
                 term.end_selection();
                 term.clear_local_echo();
@@ -1418,6 +1425,7 @@ impl Workspace {
     pub fn open_search(&mut self) {
         self.clear_focus_history_walk();
         self.cancel_layer_drag();
+        self.cancel_rearrange();
         if self.in_copy_mode() {
             self.open_copy_mode_search(super::copy_mode::SearchDirection::Forward);
             return;
@@ -1470,6 +1478,7 @@ impl Workspace {
     pub fn request(&mut self, method: &str, mut payload: Value) {
         self.clear_focus_history_walk();
         if method.starts_with("session.focus") {
+            self.cancel_rearrange();
             self.exit_copy_mode();
             self.bindings.sequence.clear();
         }
@@ -1622,6 +1631,7 @@ impl Workspace {
     /// on, so it ends here rather than at the next key: switching away and back must not bring
     /// back a mode nobody entered again.
     pub fn update_visibility(&mut self) {
+        self.cancel_rearrange();
         self.revalidate_key_modes();
         if self.session_inspector_out_of_context() {
             self.cancel_panel_quiet();
@@ -1654,6 +1664,7 @@ impl Workspace {
     }
 
     pub fn set_vertical_tabs(&mut self, vertical: bool) {
+        self.cancel_rearrange();
         self.settings.vertical_tabs = vertical;
         if vertical {
             self.sidebar.set_open(true);
@@ -1663,6 +1674,7 @@ impl Workspace {
 
     pub fn toggle_sidebar(&mut self) {
         self.clear_focus_history_walk();
+        self.cancel_rearrange();
         self.sidebar.toggle();
         self.save();
     }
@@ -1867,13 +1879,14 @@ impl Workspace {
             Intent::Settings => {
                 self.exit_copy_mode();
                 self.cancel_layer_drag();
+                self.cancel_rearrange();
                 self.leave_install_dialog();
                 self.bindings.sequence.clear();
                 self.reload_shortcuts();
                 self.shortcut_filter = TextEdit::new("");
                 self.settings_nav.opened();
                 self.recorder = None;
-                let back = self.panel.take();
+                let back = self.take_panel();
                 self.panel = Some(Panel::new(PanelKind::Settings, "Settings", &[]));
                 self.panel.as_mut().unwrap().target = back.and_then(|p| p.target);
                 self.refresh_session_inspector_watches();
@@ -2411,6 +2424,7 @@ impl Workspace {
         self.clear_focus_history_walk();
         self.exit_copy_mode();
         self.cancel_layer_drag();
+        self.cancel_rearrange();
         let target = self.panel.as_ref().and_then(|p| p.target.clone());
         let mut panel = Panel::new(
             PanelKind::Confirm {
@@ -2424,8 +2438,7 @@ impl Workspace {
         panel.target = target;
         // Asked from the switcher: cancelling goes back to it.
         panel.back = self
-            .panel
-            .take()
+            .take_panel()
             .filter(|p| {
                 matches!(p.kind, PanelKind::Picker(true))
                     || method == "server.stop" && matches!(p.kind, PanelKind::Settings)
@@ -2469,13 +2482,14 @@ impl Workspace {
         self.clear_focus_history_walk();
         self.exit_copy_mode();
         self.cancel_layer_drag();
+        self.cancel_rearrange();
         self.leave_install_dialog();
         self.bindings.sequence.clear();
         for term in self.terminals.values_mut() {
             term.clear_local_echo();
             term.end_selection();
         }
-        let previous = self.panel.take();
+        let previous = self.take_panel();
         let target = previous.as_ref().and_then(|p| p.target.clone());
         // Forms and confirmations opened from Settings go back to it; the Add host list
         // does too, and its own forms go back to the list.
@@ -2571,12 +2585,21 @@ impl Workspace {
         }
     }
 
+    pub(super) fn take_panel(&mut self) -> Option<Panel> {
+        let panel = self.panel.take();
+        // Rune can no longer deliver DragEnd to a row once its popover unmounts.
+        if matches!(panel.as_ref().map(|p| &p.kind), Some(PanelKind::Downloads)) {
+            self.downloads.dragging = None;
+        }
+        panel
+    }
+
     pub fn close_panel(&mut self, tx: &mut Tx) {
         self.leave_install_dialog();
         self.recorder = None;
         self.leave_download_dialog();
         self.bindings.sequence.clear();
-        self.panel = None;
+        drop(self.take_panel());
         self.refresh_session_inspector_watches();
         self.reconcile_prompts();
         tx.blur();
@@ -2593,13 +2616,11 @@ impl Workspace {
         }
         self.leave_download_dialog();
         self.leave_install_dialog();
-        if let Some(mut back) = self.panel.as_mut().and_then(|p| p.back.take()) {
+        if let Some(mut back) = self.take_panel().and_then(|p| p.back) {
             if let Some(input) = back.inputs.first_mut() {
                 input.focused = true;
             }
             self.panel = Some(*back);
-        } else {
-            self.panel = None;
         }
         self.refresh_session_inspector_watches();
         self.reconcile_prompts();
@@ -2615,7 +2636,7 @@ impl Workspace {
         }
         self.leave_download_dialog();
         self.leave_install_dialog();
-        if let Some(mut back) = self.panel.as_mut().and_then(|p| p.back.take()) {
+        if let Some(mut back) = self.take_panel().and_then(|p| p.back) {
             if let Some(input) = back.inputs.first_mut() {
                 input.focused = true;
             }
